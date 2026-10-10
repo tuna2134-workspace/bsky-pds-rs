@@ -94,7 +94,7 @@ pub(crate) async fn signing_key(db: &worker::D1Database, did: &str) -> XrpcResul
 }
 
 async fn load_records(db: &worker::D1Database, did: &str) -> XrpcResult<Vec<StoredRecord>> {    let rows = db
-        .prepare("SELECT collection, rkey, cid, value_json AS v FROM record WHERE did = ?1")
+        .prepare("SELECT collection, rkey, cid, value_json AS v FROM record WHERE did = ?1 AND takendown = 0")
         .bind(&[did.into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .all()

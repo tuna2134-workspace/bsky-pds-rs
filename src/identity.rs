@@ -353,8 +353,8 @@ pub fn did_key_encode(pub_compressed_hex: &str, curve: &Curve) -> Result<String,
     ))
 }
 
-#[allow(dead_code)]
-fn did_key_decode(did_key: &str) -> Result<(Curve, String), KeyError> {
+/// Decode `did:key:z…` to (curve, compressed pubkey hex).
+pub fn did_key_decode_pub(did_key: &str) -> Result<(Curve, String), KeyError> {
     let body = did_key
         .strip_prefix("did:key:z")
         .ok_or_else(|| KeyError::BadEncoding("must be did:key:z…".into()))?;
@@ -497,7 +497,7 @@ mod tests {
         let pub_hex = keys::k256_pub_from_priv(ROT_PRIV).unwrap();
         let dk = did_key_encode(&pub_hex, &Curve::K256).unwrap();
         assert!(dk.starts_with("did:key:z"));
-        let (curve, back) = did_key_decode(&dk).unwrap();
+        let (curve, back) = did_key_decode_pub(&dk).unwrap();
         assert!(matches!(curve, Curve::K256));
         assert_eq!(back, pub_hex);
     }
@@ -674,7 +674,7 @@ pub fn plc_update_op(
         return Err("rotationKeys must have 1..=5 keys".into());
     }
     for k in &rotation_keys {
-        did_key_decode(k).map_err(|e| format!("bad rotationKey: {e}"))?;
+        did_key_decode_pub(k).map_err(|e| format!("bad rotationKey: {e}"))?;
     }
     let op = serde_json::json!({
         "type": "plc_operation",
@@ -710,7 +710,7 @@ pub fn verify_plc_op(op: &serde_json::Value, rotation_keys: &[String]) -> Result
     let bytes = unsigned_op_cbor(&unsigned)?;
     let digest = keys::sha256_of(&bytes);
     for rk in rotation_keys {
-        let (_, pub_hex) = did_key_decode(rk).map_err(|e| e.to_string())?;
+        let (_, pub_hex) = did_key_decode_pub(rk).map_err(|e| e.to_string())?;
         if keys::verify_digest(&pub_hex, &digest, &sig).is_ok() {
             return Ok(());
         }

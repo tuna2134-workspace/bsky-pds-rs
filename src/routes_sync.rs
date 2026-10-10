@@ -195,7 +195,7 @@ struct SyncRecordParam {
 #[worker::send]
 async fn get_record_sync(State(s): State<SyncState>, Query(q): Query<SyncRecordParam>) -> XrpcResult<Json<serde_json::Value>> {
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let row: Option<ValRow> = db.prepare("SELECT cid, value_json AS v FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+    let row: Option<ValRow> = db.prepare("SELECT cid, value_json AS v FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3 AND takendown = 0")
         .bind(&[q.did.clone().into(), q.collection.clone().into(), q.rkey.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;

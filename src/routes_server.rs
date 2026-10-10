@@ -130,17 +130,18 @@ async fn create_account(
             #[derive(serde::Deserialize)]
             struct InviteRow {
                 used_by: Option<String>,
+                disabled: i64,
             }
             let row: Option<InviteRow> = db0
-                .prepare("SELECT used_by FROM invite_code WHERE code = ?1")
+                .prepare("SELECT used_by, disabled FROM invite_code WHERE code = ?1")
                 .bind(&[code.into()])
                 .map_err(|e| XrpcError::internal(e.to_string()))?
                 .first(None)
                 .await
                 .map_err(|e| XrpcError::internal(e.to_string()))?;
             match row {
-                Some(r) if r.used_by.is_none() => {}
-                _ => return Err(XrpcError::bad_request("InvalidInviteCode", "bad or used invite code")),
+                Some(r) if r.used_by.is_none() && r.disabled == 0 => {}
+                _ => return Err(XrpcError::bad_request("InvalidInviteCode", "bad, used, or disabled invite code")),
             }
         }
     }
@@ -733,6 +734,7 @@ async fn request_email_confirmation(
     Json(req): Json<RequestEmailConfirmationReq>,
 ) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.requestEmailConfirmation").await?;
+    crate::ratelimit::check(&s.env, &format!("email:{}", caller.did), 10, 3600).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     #[derive(serde::Deserialize)]
     struct EmailRow {
@@ -869,6 +871,7 @@ struct RequestPasswordResetReq {
 
 #[worker::send]
 async fn request_password_reset(State(s): State<ServerState>, Json(req): Json<RequestPasswordResetReq>) -> XrpcResult<Json<serde_json::Value>> {
+    crate::ratelimit::check(&s.env, &format!("email-reset:{}", crate::keys::sha256_hex(&req.email)), 5, 3600).await?;
     // Never reveal whether the email exists.
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     #[derive(serde::Deserialize)]
@@ -1253,6 +1256,7 @@ async fn check_account_status(State(s): State<ServerState>, headers: HeaderMap) 
 #[worker::send]
 async fn request_email_update(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.requestEmailUpdate").await?;
+    crate::ratelimit::check(&s.env, &format!("email:{}", caller.did), 10, 3600).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     #[derive(serde::Deserialize)]
     struct ERow {
@@ -1280,6 +1284,7 @@ async fn request_email_update(State(s): State<ServerState>, headers: HeaderMap) 
 #[worker::send]
 async fn request_account_delete(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.requestAccountDelete").await?;
+    crate::ratelimit::check(&s.env, &format!("email:{}", caller.did), 10, 3600).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     #[derive(serde::Deserialize)]
     struct ERow2 {

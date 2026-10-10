@@ -8,6 +8,7 @@ build/
 
 ### Wrangler ###
 .wrangler/
+.wrangler-*/
 .env*
 !.env.example
 .dev.vars*

@@ -61,7 +61,14 @@
 | NSID | 状態 | 備考 |
 |---|---|---|
 | getAccountInfo | ✅ | 管理者トークン必須 |
-| updateAccountPassword 等の残 admin API | ⬜ | 監査ログ・takedown 伝播と同時実装 |
+| updateAccountPassword / updateAccountEmail / updateAccountHandle | ✅ | 管理者代行 (handle 変更は identity 発火) |
+| updateAccountSigningKey | ✅ | did:key 採用・空 commit 再署名 |
+| deleteAccount (admin) | ✅ | 強制削除 |
+| disableAccountInvites / enableAccountInvites | ✅ | フラグ管理 |
+| disableInviteCodes / getInviteCodes | ✅ | kill-switch・一覧 |
+| getAccountInfos / searchAccounts | ✅ | 一括・検索 |
+| getSubjectStatus / updateSubjectStatus | ✅ | takedown/停止の伝播 (記録・blob は非破壊秘匿) |
+| sendEmail (admin) | ✅ | 任意送信 |
 | レート制限 (429+Retry-After) / /metrics | ✅ | D1 固定ウィンドウ・集計エンドポイント |
 
 ## OAuth (`/.well-known/*`, `/oauth/*`, `/jwks.json`)

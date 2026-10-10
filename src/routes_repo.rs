@@ -105,7 +105,7 @@ struct AcctLite {
 #[worker::send]
 async fn collections_for(env: &Env, did: &str) -> XrpcResult<Vec<String>> {
     let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let rows = db.prepare("SELECT DISTINCT collection AS c FROM record WHERE did = ?1")
+    let rows = db.prepare("SELECT DISTINCT collection AS c FROM record WHERE did = ?1 AND takendown = 0")
         .bind(&[did.into()]).map_err(|e| XrpcError::internal(e.to_string()))?
         .all().await.map_err(|e| XrpcError::internal(e.to_string()))?;
     let mut out = Vec::new();
@@ -226,7 +226,7 @@ struct GetRecordParam {
 #[worker::send]
 async fn get_record(State(s): State<RepoState>, Query(q): Query<GetRecordParam>) -> XrpcResult<Json<serde_json::Value>> {
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let row: Option<RecRow> = db.prepare("SELECT cid, value_json AS v, rev FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+    let row: Option<RecRow> = db.prepare("SELECT cid, value_json AS v, rev FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3 AND takendown = 0")
         .bind(&[q.repo.clone().into(), q.collection.clone().into(), q.rkey.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
@@ -398,12 +398,12 @@ async fn list_records(State(s): State<RepoState>, Query(q): Query<ListParam>) ->
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     // Cursor = rkey offset (TID-ordered).
     let rows = if let Some(cur) = q.cursor.clone() {
-        db.prepare("SELECT rkey AS k, cid AS c, value_json AS v FROM record WHERE did = ?1 AND collection = ?2 AND rkey > ?3 ORDER BY rkey ASC LIMIT ?4")
+        db.prepare("SELECT rkey AS k, cid AS c, value_json AS v FROM record WHERE did = ?1 AND collection = ?2 AND rkey > ?3 AND takendown = 0 ORDER BY rkey ASC LIMIT ?4")
             .bind(&[q.repo.clone().into(), q.collection.clone().into(), cur.into(), (limit as f64).into()])
             .map_err(|e| XrpcError::internal(e.to_string()))?
             .all().await.map_err(|e| XrpcError::internal(e.to_string()))?
     } else {
-        db.prepare("SELECT rkey AS k, cid AS c, value_json AS v FROM record WHERE did = ?1 AND collection = ?2 ORDER BY rkey ASC LIMIT ?3")
+        db.prepare("SELECT rkey AS k, cid AS c, value_json AS v FROM record WHERE did = ?1 AND collection = ?2 AND takendown = 0 ORDER BY rkey ASC LIMIT ?3")
             .bind(&[q.repo.clone().into(), q.collection.clone().into(), (limit as f64).into()])
             .map_err(|e| XrpcError::internal(e.to_string()))?
             .all().await.map_err(|e| XrpcError::internal(e.to_string()))?

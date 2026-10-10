@@ -212,7 +212,8 @@ def main():
                          "record": {"$type": "app.bsky.feed.post", "text": text,
                                     "createdAt": "2026-10-10T00:00:00.000Z"}}, auth=auth1)
         check(f"source write {i}", st == 200, "")
-    st, _, up = call(BASE1, "POST", "/xrpc/com.atproto.repo.uploadBlob", raw=b"fake-image-bytes",
+    png = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"\x00" * 32
+    st, _, up = call(BASE1, "POST", "/xrpc/com.atproto.repo.uploadBlob", raw=png,
                      auth=auth1, ctype="image/png")
     blob_cid = up["blob"]["ref"]["$link"]
     st, _, _ = call(BASE1, "POST", "/xrpc/com.atproto.repo.createRecord",
