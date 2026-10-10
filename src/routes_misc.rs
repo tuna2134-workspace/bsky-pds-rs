@@ -63,6 +63,7 @@ struct UpdateHandleReq {
 #[worker::send]
 async fn update_handle(State(s): State<IdentityState>, headers: HeaderMap, Json(req): Json<UpdateHandleReq>) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.identity.updateHandle").await?;
+    auth::require_write_scope(&caller)?;
     if !atproto::handle::validate(&req.handle) {
         return Err(XrpcError::bad_request("InvalidHandle", "bad handle"));
     }
@@ -167,6 +168,7 @@ pub fn blob_router(env: Env) -> Router {
 async fn upload_blob(State(s): State<BlobState>, headers: HeaderMap, body: axum::body::Bytes) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.uploadBlob").await?;
     crate::repo::require_active(&s.env, &caller.did).await?;
+    auth::require_write_scope(&caller)?;
     crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     if body.len() > cfg.blob_upload_limit {
@@ -205,6 +207,7 @@ struct BlobListParam {
 
 #[worker::send]
 async fn list_blobs(State(s): State<BlobState>, Query(q): Query<BlobListParam>) -> XrpcResult<Json<serde_json::Value>> {
+    crate::repo::require_active_for_sync(&s.env, &q.did).await?;
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let rows = db.prepare("SELECT cid, mime, size FROM blob WHERE did = ?1 AND takendown = 0 ORDER BY created_at LIMIT ?2")
@@ -240,6 +243,9 @@ async fn get_blob(State(s): State<BlobState>, Query(q): Query<GetBlobParam>) -> 
         .bind(&[q.did.clone().into(), q.cid.clone().into()]).map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
     let Some(b) = row else { return Err(XrpcError::not_found("BlobNotFound", "unknown blob")); };
+    crate::repo::require_active_for_sync(&s.env, &q.did)
+        .await
+        .map_err(|_| XrpcError::not_found("BlobNotFound", "unavailable"))?;
     if b.takendown == 1 {
         return Err(XrpcError::not_found("BlobNotFound", "unavailable"));
     }

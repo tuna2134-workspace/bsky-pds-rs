@@ -177,3 +177,17 @@ pub fn require_full_password(caller: &Caller, endpoint: &str) -> Result<(), Xrpc
     }
     Ok(())
 }
+
+/// Write operations need resource authorization, not just authentication.
+/// Compat sessions always carry `transition:generic`; OAuth sessions with
+/// only the bare `atproto` scope are read-only (identity authentication).
+/// Granular `repo`/`rpc` permission enforcement is ROADMAP future work.
+pub fn require_write_scope(caller: &Caller) -> Result<(), XrpcError> {
+    if caller.oauth && !caller.scope.split(' ').any(|x| x == "transition:generic") {
+        return Err(XrpcError::forbidden(
+            "AuthFailed",
+            "atproto-only sessions are read-only; request the transition:generic scope",
+        ));
+    }
+    Ok(())
+}

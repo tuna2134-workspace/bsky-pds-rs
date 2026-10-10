@@ -38,7 +38,8 @@
 | NSID | 状態 | 備考 |
 |---|---|---|
 | getRepoStatus / listRepos / getLatestCommit | ✅ | 実 commit CID・rev |
-| getRepo / getRecord / getBlocks | ✅ | バイナリ CAR (`application/vnd.ipld.car`)。ハッシュ検証付き parse |
+| getRepo / getRecord / getBlocks | ✅ | バイナリ CAR。非 active は配布停止 (403)、未知は 404 |
+| blob 取得系 | ✅ | 非 active・takedown は秘匿 |
 | getBlocks | ✅ | バイナリ CAR サブセット |
 | listBlobs / getBlob | ✅ | R2 実体 (blob_router) |
 | subscribeRepos | ✅ | WebSocket (event-stream v0: header+payload CBOR 連結)。`cursor` 再開・`FutureCursor`・ポーリング JSON 互換も維持 |

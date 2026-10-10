@@ -65,6 +65,7 @@
 - [x] PLC 監査連鎖の完全検証器 (`verify_audit_log`: genesis 再計算・回転鍵署名・CID 連鎖・偽造/入替拒否)
 - [ ] 監査ログの定期的再検証・secret store 移管・残 admin API・メトリクス拡充
 - [x] レート制限 (D1 固定ウィンドウ・429+Retry-After)・SMTP タイムアウト・`/metrics`
+- [x] 配布規律: 非 active の sync/blob 配布停止 (owner 読取は維持)・OAuth atproto-only の読取専用化
 - [ ] 取下げ/停止/削除のホスティング状態伝播
 
 ## 5. AppView/Relay 連携・運用 (+ 定期監査)

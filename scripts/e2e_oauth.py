@@ -294,6 +294,7 @@ def main():
                                        "createdAt": "2026-10-10T00:00:00.000Z"}},
                            auth="DPoP " + access, dpop=proof)
     check("DPoP-authed createRecord", st == 200 and rec["cid"].startswith("bafyrei"), str(rec)[:140])
+    RKEY = rec["uri"].rsplit("/", 1)[-1]
 
     # getSession over OAuth (email hidden without transition:email)
     proof2 = dpop_proof("GET", BASE + "/xrpc/com.atproto.server.getSession", ath=ath)
@@ -381,6 +382,63 @@ def main():
                  "redirect_uri": CONF_REDIRECT, "code_verifier": verifier2}, nonce=n)
         check("confidential token exchange", st == 200 and body2.get("sub") == did,
               str(body2)[:140])
+
+    # ---- atproto-only scope is read-only ----
+    verifier3 = b64u(os.urandom(32))
+    challenge3 = b64u(hashlib.sha256(verifier3.encode()).digest())
+    st, _, par3 = form("/oauth/par", {
+        "client_id": META_URL, "redirect_uri": REDIRECT,
+        "scope": "atproto", "state": "ro-state",
+        "code_challenge": challenge3, "code_challenge_method": "S256"})
+    check("atproto-only PAR", st == 200, "")
+    st, _, done3 = form("/oauth/authorize?format=json",
+                        {"request_uri": par3["request_uri"], "handle": HANDLE,
+                         "password": "s3cret-pw-long"})
+    code3 = done3["code"]
+    st, hdrs, body3 = token_exchange({"grant_type": "authorization_code", "code": code3,
+                                      "redirect_uri": REDIRECT, "code_verifier": verifier3})
+    if st == 400 and body3.get("error") == "use_dpop_nonce":
+        n = hget(hdrs, "dpop-nonce")
+        st, _, body3 = token_exchange({"grant_type": "authorization_code", "code": code3,
+                                       "redirect_uri": REDIRECT, "code_verifier": verifier3}, nonce=n)
+    check("atproto-only token", st == 200 and body3.get("scope") == "atproto", str(body3)[:100])
+    ro_access = body3["access_token"]
+    ro_ath = b64u(hashlib.sha256(ro_access.encode()).digest())
+    # read works
+    proof_ro = dpop_proof("GET", BASE + "/xrpc/com.atproto.server.getSession", ath=ro_ath)
+    st, _, _ = get("/xrpc/com.atproto.server.getSession", auth="DPoP " + ro_access, dpop=proof_ro)
+    check("atproto-only read", st == 200, "")
+    # write rejected
+    proof_ro_w = dpop_proof("POST", BASE + "/xrpc/com.atproto.repo.createRecord", ath=ro_ath)
+    st, _, body_ro = post_json("/xrpc/com.atproto.repo.createRecord",
+                               {"repo": did, "collection": "app.bsky.feed.post",
+                                "record": {"$type": "app.bsky.feed.post", "text": "nope",
+                                           "createdAt": "2026-10-10T00:00:00.000Z"}},
+                               auth="DPoP " + ro_access, dpop=proof_ro_w)
+    check("atproto-only write rejected", st == 403, f"{st} {str(body_ro)[:80]}")
+
+    # ---- deactivation gates redistribution, not owner reads ----
+    st, _, fresh = post_json("/xrpc/com.atproto.server.createSession",
+                             {"identifier": HANDLE, "password": "s3cret-pw-long"})
+    check("fresh compat session", st == 200, "")
+    owner = "Bearer " + fresh["accessJwt"]
+    st, _, _ = post_json("/xrpc/com.atproto.server.deactivateAccount", {},
+                         auth=owner)
+    check("deactivate", st == 200, "")
+    st, _, _ = get(f"/xrpc/com.atproto.sync.getRepo?did={did}")
+    check("getRepo gated", st == 403, "")
+    import urllib.request as _u
+    try:
+        _u.urlopen(BASE + f"/xrpc/com.atproto.repo.getRecord?repo={did}&collection=app.bsky.feed.post&rkey={RKEY}")
+        read_open = True
+    except urllib.error.HTTPError as e:
+        read_open = e.code == 200
+    check("owner read stays open", read_open, "")
+    st, _, _ = post_json("/xrpc/com.atproto.server.activateAccount", {},
+                         auth=owner)
+    check("reactivate", st == 200, "")
+    st, _, _ = get(f"/xrpc/com.atproto.sync.getRepo?did={did}")
+    check("getRepo restored", st == 200, "")
 
     if fails:
         print("FAILURES:", fails)

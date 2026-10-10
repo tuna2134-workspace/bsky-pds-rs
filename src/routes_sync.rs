@@ -110,6 +110,7 @@ struct ListRow {
 
 #[worker::send]
 async fn get_repo(State(s): State<SyncState>, Query(q): Query<DidParam>) -> XrpcResult<axum::response::Response> {
+    crate::repo::require_active_for_sync(&s.env, &q.did).await?;
     let exp = crate::repo::export_repo(&s.env, &q.did).await?;
     use axum::response::IntoResponse;
     Ok(([(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")], exp.car).into_response())
@@ -166,6 +167,7 @@ async fn get_blocks(State(s): State<SyncState>, Query(q): Query<GetBlocksParam>)
     if wanted.len() > 500 {
         return Err(XrpcError::bad_request("InvalidRequest", "too many cids"));
     }
+    crate::repo::require_active_for_sync(&s.env, &q.did).await?;
     let exp = crate::repo::export_repo(&s.env, &q.did).await?;
     // Re-split commit/MST/record blocks from the full export CAR.
     let (_, blocks) = crate::mst::parse_car(&exp.car).map_err(|e| XrpcError::internal(e.to_string()))?;
@@ -194,6 +196,7 @@ struct SyncRecordParam {
 
 #[worker::send]
 async fn get_record_sync(State(s): State<SyncState>, Query(q): Query<SyncRecordParam>) -> XrpcResult<Json<serde_json::Value>> {
+    crate::repo::require_active_for_sync(&s.env, &q.did).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<ValRow> = db.prepare("SELECT cid, value_json AS v FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3 AND takendown = 0")
         .bind(&[q.did.clone().into(), q.collection.clone().into(), q.rkey.clone().into()])

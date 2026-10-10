@@ -157,6 +157,7 @@ async fn create_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
     repo::require_active(&s.env, &caller.did).await?;
+    auth::require_write_scope(&caller)?;
     crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     if !atproto::nsid::validate(&req.collection) {
         return Err(XrpcError::bad_request("InvalidNsid", "collection must be a valid NSID"));
@@ -277,6 +278,7 @@ async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): J
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
     repo::require_active(&s.env, &caller.did).await?;
+    auth::require_write_scope(&caller)?;
     crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     if !atproto::nsid::validate(&req.collection) || !atproto::record_key::validate(&req.rkey) {
         return Err(XrpcError::bad_request("InvalidRequest", "bad collection or rkey"));
@@ -343,6 +345,7 @@ async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
     repo::require_active(&s.env, &caller.did).await?;
+    auth::require_write_scope(&caller)?;
     crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     if let Some(expected) = req.swap_record.as_deref() {
@@ -453,6 +456,7 @@ async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req):
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
     repo::require_active(&s.env, &caller.did).await?;
+    auth::require_write_scope(&caller)?;
     crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let now = pds_env::now_iso();

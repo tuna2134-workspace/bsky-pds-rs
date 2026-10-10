@@ -282,3 +282,19 @@ pub(crate) async fn require_active(env: &Env, did: &str) -> XrpcResult<()> {
         None => Err(XrpcError::unauthorized("unknown account")),
     }
 }
+
+/// Redistribution gate: unknown accounts stay 404, inactive ones 403.
+/// Reads under `repo.*` remain owner-visible; everything under `sync.*`
+/// and blob serving funnels through here.
+pub(crate) async fn require_active_for_sync(env: &Env, did: &str) -> XrpcResult<()> {
+    match require_active(env, did).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.status == axum::http::StatusCode::UNAUTHORIZED => {
+            Err(crate::xrpc::XrpcError::not_found("RepoNotFound", "unknown account"))
+        }
+        Err(_) => Err(crate::xrpc::XrpcError::forbidden(
+            "AccountDeactivated",
+            "repository not currently active",
+        )),
+    }
+}
