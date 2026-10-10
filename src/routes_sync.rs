@@ -20,6 +20,8 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.sync.getRepoStatus", get(get_repo_status))
         .route("/xrpc/com.atproto.sync.listRepos", get(list_repos))
         .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
+        .route("/xrpc/com.atproto.sync.getCheckout", get(get_repo))
+        .route("/xrpc/com.atproto.sync.getHead", get(get_head))
         .route("/xrpc/com.atproto.sync.getBlocks", get(get_blocks))
         .route("/xrpc/com.atproto.sync.getRecord", get(get_record_sync))
         // NOTE: listBlobs/getBlob live in blob_router (R2-backed). Do not re-register here.
@@ -371,4 +373,27 @@ async fn list_repos_by_collection(
         }
     }
     Ok(Json(out))
+}
+
+/// Deprecated alias target: current head commit root CID.
+#[worker::send]
+async fn get_head(State(s): State<SyncState>, Query(q): Query<DidParam>) -> XrpcResult<Json<serde_json::Value>> {
+    crate::repo::require_active_for_sync(&s.env, &q.did).await
+        .map_err(|_| XrpcError::not_found("HeadNotFound", "no head for this repo"))?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct RootRow {
+        commit_cid: String,
+    }
+    let row: Option<RootRow> = db
+        .prepare("SELECT commit_cid FROM repo_root WHERE did = ?1")
+        .bind(&[q.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    match row {
+        Some(r) => Ok(Json(serde_json::json!({ "root": r.commit_cid }))),
+        None => Err(XrpcError::not_found("HeadNotFound", "no head for this repo")),
+    }
 }
