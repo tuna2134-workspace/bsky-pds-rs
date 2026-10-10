@@ -32,7 +32,7 @@
 
 - [ ] `#commit/#sync/#identity/#account` の CBOR + WebSocket 本体 (`wss://…/subscribeRepos?cursor=`)
 - [ ] `seq` 永続化の競合対策 (D1 単調採番の検証・Relay desync 修復手順の文書化)
-- [ ] `Atproto-Repo-Rev` レスポンスヘッダ
+- [x] `Atproto-Repo-Rev` レスポンスヘッダ (全 repo 書き込みに付与)
 - [ ] record-level resync ワーカー設計 (外部 Relay 向けは別サービス)
 
 ## 3. OAuth 完成 (Spec: [oauth](https://atproto.com/specs/oauth))
@@ -52,15 +52,17 @@
 
 ## 4. Identity / 連合 (Specs: [did](https://atproto.com/specs/did), [handle](https://atproto.com/specs/handle), [account](https://atproto.com/specs/account))
 
-- [ ] `did:plc` 解決 + `did:web` 解決・DID Document 検証 (署名鍵 `#atproto` Multikey 新旧形式)
-- [ ] handle 双方向検証 (DNS TXT + `/.well-known/atproto-did`)
-- [ ] PLC 監査ログ連携 (rotation key 運用・`PDS_PLC_ROTATION_KEY_*`)
+- [x] `did:plc` 解決 + `did:web` 解決 (localhost ポート対応)・DID Document 検証 (署名鍵 `#atproto` Multikey 新旧形式)・KV キャッシュ (`src/identity.rs`)
+- [x] handle 双方向検証 (well-known + DNS TXT over DoH)。自ドメインは DB 権威 + 文書主張確認。`describeRepo.handleIsCorrect` が live 判定
+- [x] PLC genesis 生成・low-S 署名・DID 計算・submit + rotation 鍵保存。公開 handle の signup で実登録 (`scripts/e2e_plc.py` がスタブ相手に検証)。loopback は dev DID
+- [x] Relay 通知: 作成時 + `requestCrawl` 経由の best-effort announce (`PDS_CRAWLERS`)
+- [ ] PLC 監査ログ連携・rotation 鍵の secret store 移管・`PDS_PLC_ROTATION_KEY_*` 運用
 - [ ] アカウント移行フロー (`#identity/#account` 発火順・旧/新 PDS 状態遷移)
-- [ ] 取下げ/停止/削除のホスティング状態伝播・Relay 通知 (`PDS_CRAWLERS`)
+- [ ] 取下げ/停止/削除のホスティング状態伝播
 
 ## 5. AppView/Relay 連携・運用
 
-- [ ] service proxying (`atproto-proxy` 転送 + inter-service JWT `lxm/aud/kid`)
+- [x] service proxying (`atproto-proxy` 転送 + inter-service JWT `lxm/aud` ES256K・SSRF ガード)。スタブ AppView 相手に中継+署名検証の E2E 済み (`scripts/e2e_proxy.py`)
 - [ ] メール (SMTP) 検証・パスワードリセット・`checkAccountStatus`
 - [ ] `com.atproto.admin.*` 拡充・監査ログ
 - [ ] レート制限・サイズ制限の本番値・OpenTelemetry メトリクス

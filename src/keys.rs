@@ -25,6 +25,7 @@ impl std::fmt::Display for KeyError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Curve {
     K256,
     P256,
@@ -387,6 +388,35 @@ fn verify_digest_p256(pub_hex: &str, digest: &[u8; 32], sig64: &[u8]) -> Result<
     vk.verify_prehash(digest, &sig).map_err(|_| KeyError::VerifyFailed)
 }
 
+/// Sign JWT claims with ES256K (secp256k1 + SHA-256, atproto inter-service auth).
+/// Header: {"alg":"ES256K","typ":"JWT"}. Compact R||S signature, base64url.
+pub fn sign_jwt_es256k(priv_hex: &str, claims: &serde_json::Value) -> Result<String, KeyError> {
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    let header = serde_json::json!({ "alg": "ES256K", "typ": "JWT" });
+    let h = b64u(header.to_string().as_bytes());
+    let p = b64u(claims.to_string().as_bytes());
+    let digest = sha256_of(format!("{h}.{p}").as_bytes());
+    let bytes = hex::decode(priv_hex.trim()).map_err(|_| KeyError::BadEncoding("priv hex".into()))?;
+    let signing = K256Signing::from_bytes(bytes.as_slice().into())
+        .map_err(|_| KeyError::BadEncoding("secret key".into()))?;
+    let (sig, _) = signing.sign_prehash(&digest).map_err(|_| KeyError::BadEncoding("sign failed".into()))?;
+    Ok(format!("{h}.{p}.{}", b64u(&sig.to_bytes())))
+}
+
+/// Verify an ES256K JWT against a compressed secp256k1 pubkey (hex). Returns payload.
+pub fn verify_jwt_es256k(token: &str, pub_hex: &str) -> Result<serde_json::Value, KeyError> {
+    let (header, payload, sig, signing_input) = jwt_split(token)?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("ES256K") {
+        return Err(KeyError::BadEncoding("alg must be ES256K".into()));
+    }
+    if sig.len() != 64 {
+        return Err(KeyError::BadEncoding("sig must be 64 bytes".into()));
+    }
+    let digest = sha256_of(signing_input.as_bytes());
+    verify_digest(pub_hex, &digest, &sig)?;
+    Ok(payload)
+}
+
 /// Sign JWT claims with HS256 (compat session tokens). `typ`: `at+jwt` / `refresh+jwt`.
 pub fn sign_jwt_hs256(secret: &str, typ: &str, claims: &serde_json::Value) -> Result<String, KeyError> {
     use hmac::{Hmac, Mac};
@@ -431,4 +461,21 @@ pub fn pkce_s256_challenge(verifier: &str) -> String {
 /// SHA-256 hex (for storing token hashes, never the tokens).
 pub fn sha256_hex(s: &str) -> String {
     hex::encode(sha256_of(s.as_bytes()))
+}
+
+#[cfg(test)]
+mod es256k_tests {
+    use super::*;
+
+    #[test]
+    fn es256k_jwt_roundtrip() {
+        // Fixed k256 key (test only).
+        let priv_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let pub_hex = k256_pub_from_priv(priv_hex).unwrap();
+        let claims = serde_json::json!({"iss": "did:plc:test", "aud": "did:web:example.com#service", "lxm": "com.atproto.sync.getRepo"});
+        let tok = sign_jwt_es256k(priv_hex, &claims).unwrap();
+        let back = verify_jwt_es256k(&tok, &pub_hex).unwrap();
+        assert_eq!(back["lxm"], serde_json::Value::String("com.atproto.sync.getRepo".into()));
+        assert!(verify_jwt_es256k(&tok, &pub_hex.replace('0', "1")).is_err());
+    }
 }

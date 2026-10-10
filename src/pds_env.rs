@@ -11,6 +11,7 @@ pub struct PdsEnv {
     pub jwt_secret: Option<String>,
     pub invite_required: bool,
     pub blob_upload_limit: usize,
+    pub crawlers: String,
 }
 
 impl PdsEnv {
@@ -24,6 +25,7 @@ impl PdsEnv {
             jwt_secret: env.var("PDS_JWT_SECRET").map(|v| v.to_string()).ok(),
             invite_required: env.var("PDS_INVITE_REQUIRED").map(|v| v.to_string()).unwrap_or_else(|_| "true".into()) == "true",
             blob_upload_limit: env.var("PDS_BLOB_UPLOAD_LIMIT").map(|v| v.to_string()).ok().and_then(|s| s.parse().ok()).unwrap_or(52_428_800),
+            crawlers: env.var("PDS_CRAWLERS").map(|v| v.to_string()).unwrap_or_else(|_| "https://bsky.network".into()),
         })
     }
 }

@@ -67,7 +67,7 @@ pub fn canonical_record_cid(value: &serde_json::Value) -> XrpcResult<(String, Ci
 
 /// Fetch the account signing key, backfilling one for pre-CBOR accounts
 /// (zero-downtime upgrade: old rows have NULL key columns).
-async fn signing_key(db: &worker::D1Database, did: &str) -> XrpcResult<String> {
+pub(crate) async fn signing_key(db: &worker::D1Database, did: &str) -> XrpcResult<String> {
     let row: Option<KeyRow> = db
         .prepare("SELECT signing_key_k256_priv_hex AS priv_hex FROM account WHERE did = ?1")
         .bind(&[did.into()])

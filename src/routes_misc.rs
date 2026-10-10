@@ -60,19 +60,78 @@ async fn update_handle(State(s): State<IdentityState>, headers: HeaderMap, Json(
     if !atproto::handle::validate(&req.handle) {
         return Err(XrpcError::bad_request("InvalidHandle", "bad handle"));
     }
+    let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let own_domain = req.handle == cfg.hostname || req.handle.ends_with(&format!(".{}", cfg.hostname));
+    if !own_domain {
+        // External handle: require bidirectional proof that it points at this DID.
+        match crate::identity::resolve_handle_to_did(&s.env, &req.handle).await {
+            Ok(Some(d)) if d == caller.did => {}
+            _ => {
+                return Err(XrpcError::bad_request(
+                    "InvalidHandle",
+                    "handle does not resolve to your DID (set DNS TXT _dnslink or /.well-known/atproto-did first)",
+                ))
+            }
+        }
+    }
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(Deserialize)]
+    struct TakenRow {
+        did: String,
+    }
+    let taken: Option<TakenRow> = db
+        .prepare("SELECT did FROM account WHERE handle = ?1")
+        .bind(&[req.handle.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    if let Some(t) = taken {
+        if t.did != caller.did {
+            return Err(XrpcError::bad_request("InvalidHandle", "handle already taken"));
+        }
+    }
     let now = pds_env::now_iso();
     db.prepare("UPDATE account SET handle = ?1, updated_at = ?2 WHERE did = ?3")
         .bind(&[req.handle.into(), now.into(), caller.did.into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
-        .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
+        .run()
+        .await
+        .map_err(|_| XrpcError::bad_request("InvalidHandle", "handle update failed"))?;
     Ok(Json(serde_json::json!({})))
 }
 
-/// `/.well-known/atproto-did` — handle -> DID (plain text DID).
+/// `/.well-known/atproto-did` — per-host handle -> DID (plain text).
+/// Served for every subdomain thanks to the wildcard DNS: the Host header
+/// selects the account; the bare PDS hostname answers its own DID.
 #[worker::send]
-async fn well_known_did(State(s): State<IdentityState>) -> XrpcResult<String> {
+async fn well_known_did(State(s): State<IdentityState>, headers: HeaderMap) -> XrpcResult<String> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or(&cfg.hostname)
+        .split(':')
+        .next()
+        .unwrap_or(&cfg.hostname)
+        .to_lowercase();
+    if host != cfg.hostname {
+        let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct HRow {
+            did: String,
+        }
+        let row: Option<HRow> = db
+            .prepare("SELECT did FROM account WHERE handle = ?1")
+            .bind(&[host.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first(None)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        if let Some(r) = row {
+            return Ok(r.did);
+        }
+    }
     Ok(format!("did:web:{}", cfg.hostname))
 }
 
@@ -251,7 +310,7 @@ pub fn oauth_router(env: Env) -> Router {
 async fn protected_resource(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800,
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(),
     });
     Json(serde_json::json!({
         "resource": format!("https://{}", cfg.hostname),
@@ -265,7 +324,7 @@ async fn protected_resource(State(s): State<OAuthState>) -> Json<serde_json::Val
 async fn auth_server_meta(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800,
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(),
     });
     let iss = format!("https://{}", cfg.hostname);
     Json(serde_json::json!({
@@ -287,7 +346,7 @@ async fn auth_server_meta(State(s): State<OAuthState>) -> Json<serde_json::Value
 async fn did_json(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800,
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(),
     });
     let origin = format!("https://{}", cfg.hostname);
     Json(serde_json::json!({

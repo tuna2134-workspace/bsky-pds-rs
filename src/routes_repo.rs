@@ -80,12 +80,13 @@ async fn describe_repo(State(s): State<RepoState>, Query(q): Query<RepoParam>) -
     let cols: Vec<String> = collections_for(&s.env, &a.did).await?;
     let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let endpoint = format!("https://{}", cfg.hostname);
+    let handle_is_correct = crate::identity::handle_is_correct(&s.env, &a.did, &a.handle).await;
     Ok(Json(DescribeRepoResp {
         handle: a.handle.clone(),
         did: a.did.clone(),
         did_doc: did_doc_for(&a.did, &a.handle, a.pub_hex.as_deref(), &endpoint),
         collections: cols,
-        handle_is_correct: true,
+        handle_is_correct,
     }))
 }
 
@@ -115,6 +116,16 @@ struct ColRow {
     c: String,
 }
 
+/// Spec: sync visibility — every mutation response carries the new `rev`.
+fn with_rev(rev: &str, body: serde_json::Value) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        [("atproto-repo-rev", rev.to_string())],
+        Json(body),
+    )
+        .into_response()
+}
+
 // --- createRecord ---
 
 #[derive(Deserialize)]
@@ -134,18 +145,8 @@ struct CreateRecordReq {
     swap_commit: Option<String>,
 }
 
-#[derive(Serialize)]
-struct WriteResp {
-    #[serde(rename = "uri")]
-    uri: String,
-    #[serde(rename = "cid")]
-    cid: String,
-    #[serde(rename = "commit")]
-    commit: serde_json::Value,
-}
-
 #[worker::send]
-async fn create_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<CreateRecordReq>) -> XrpcResult<Json<WriteResp>> {
+async fn create_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<CreateRecordReq>) -> XrpcResult<axum::response::Response> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.createRecord").await?;
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
@@ -180,11 +181,14 @@ async fn create_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
         .bind(&[out.rev.clone().into(), req.repo.clone().into(), req.collection.clone().into(), rkey.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    Ok(Json(WriteResp {
-        uri: format!("at://{}/{}/{}", req.repo, req.collection, rkey),
-        cid: cid.to_string(),
-        commit: serde_json::json!({"cid": out.commit.to_string(), "rev": out.rev}),
-    }))
+    Ok(with_rev(
+        &out.rev,
+        serde_json::json!({
+            "uri": format!("at://{}/{}/{}", req.repo, req.collection, rkey),
+            "cid": cid.to_string(),
+            "commit": {"cid": out.commit.to_string(), "rev": out.rev},
+        }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -255,7 +259,7 @@ struct PutRecordReq {
 }
 
 #[worker::send]
-async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<PutRecordReq>) -> XrpcResult<Json<WriteResp>> {
+async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<PutRecordReq>) -> XrpcResult<axum::response::Response> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.putRecord").await?;
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
@@ -286,11 +290,14 @@ async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): J
         .bind(&[out.rev.clone().into(), req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    Ok(Json(WriteResp {
-        uri: format!("at://{}/{}/{}", req.repo, req.collection, req.rkey),
-        cid: cid.to_string(),
-        commit: serde_json::json!({"cid": out.commit.to_string(), "rev": out.rev}),
-    }))
+    Ok(with_rev(
+        &out.rev,
+        serde_json::json!({
+            "uri": format!("at://{}/{}/{}", req.repo, req.collection, req.rkey),
+            "cid": cid.to_string(),
+            "commit": {"cid": out.commit.to_string(), "rev": out.rev},
+        }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -308,7 +315,7 @@ struct DeleteRecordReq {
 }
 
 #[worker::send]
-async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<DeleteRecordReq>) -> XrpcResult<Json<serde_json::Value>> {
+async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<DeleteRecordReq>) -> XrpcResult<axum::response::Response> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.deleteRecord").await?;
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
@@ -330,7 +337,10 @@ async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
     let ops = vec![serde_json::json!({"action":"delete","path":format!("{}/{}", req.collection, req.rkey)})];
     let out = repo::commit_repo(&s.env, &req.repo, ops, vec![], req.swap_commit.as_deref()).await?;
-    Ok(Json(serde_json::json!({"commit": {"cid": out.commit.to_string(), "rev": out.rev}})))
+    Ok(with_rev(
+        &out.rev,
+        serde_json::json!({"commit": {"cid": out.commit.to_string(), "rev": out.rev}}),
+    ))
 }
 
 // --- listRecords ---
@@ -405,7 +415,7 @@ struct ApplyWritesReq {
 }
 
 #[worker::send]
-async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<ApplyWritesReq>) -> XrpcResult<Json<serde_json::Value>> {
+async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<ApplyWritesReq>) -> XrpcResult<axum::response::Response> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.applyWrites").await?;
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
@@ -477,8 +487,11 @@ async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req):
         .bind(&[out.rev.clone().into(), req.repo.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    Ok(Json(serde_json::json!({
-        "commit": {"cid": out.commit.to_string(), "rev": out.rev},
-        "results": results,
-    })))
+    Ok(with_rev(
+        &out.rev,
+        serde_json::json!({
+            "commit": {"cid": out.commit.to_string(), "rev": out.rev},
+            "results": results,
+        }),
+    ))
 }

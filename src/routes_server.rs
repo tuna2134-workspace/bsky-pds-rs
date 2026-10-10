@@ -116,8 +116,18 @@ async fn create_account(
     })?;
     let password_hash = crate::oauth::hash_password(&password)?;
 
-    // DID: accept caller-provided did:plc (migration/reservation) else mint placeholder.
-    // Full PLC directory registration happens out-of-band; doc updated on activation.
+    // Fresh atproto signing key + PLC rotation key (both secp256k1).
+    // Rotation keys belong in a secret store long-term (ROADMAP §4).
+    let (priv_hex, pub_hex) = crate::keys::generate_k256().map_err(|e| XrpcError::internal(e.to_string()))?;
+    let (rot_priv_hex, rot_pub_hex) = crate::keys::generate_k256().map_err(|e| XrpcError::internal(e.to_string()))?;
+
+    // DID: caller-provided (migration/reservation), real PLC registration for
+    // public handles, or a local dev DID for loopback handles.
+    let local_handle = req.handle == "localhost"
+        || req.handle.ends_with(".localhost")
+        || req.handle.starts_with("localhost:")
+        || req.handle.starts_with("127.")
+        || req.handle.starts_with("[::1]");
     let did = match req.did {
         Some(d) => {
             if !atproto::did::validate(&d) {
@@ -125,23 +135,41 @@ async fn create_account(
             }
             d
         }
-        None => format!("did:plc:dev{}", &uuid::Uuid::new_v4().simple().to_string()[..24]),
+        None if local_handle => {
+            format!("did:plc:dev{}", &uuid::Uuid::new_v4().simple().to_string()[..24])
+        }
+        None => {
+            // Real federation path: build + sign a PLC genesis op and register it.
+            let rotation_did_key = crate::identity::did_key_encode(&rot_pub_hex, &crate::keys::Curve::K256)
+                .map_err(|e| XrpcError::internal(e.to_string()))?;
+            let signing_did_key = crate::identity::did_key_encode(&pub_hex, &crate::keys::Curve::K256)
+                .map_err(|e| XrpcError::internal(e.to_string()))?;
+            let (did, op) = crate::identity::plc_genesis_op(
+                &rot_priv_hex,
+                &crate::identity::PlcGenesis {
+                    rotation_did_key,
+                    signing_did_key,
+                    handle: req.handle.clone(),
+                    pds_endpoint: format!("https://{}", cfg.hostname),
+                },
+            )
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+            crate::identity::plc_submit(&s.env, &did, &op).await?;
+            did
+        }
     };
 
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let now = pds_env::now_iso();
-    // Fresh atproto signing key (secp256k1). Stored alongside the account;
-    // rotation into a secret store is ROADMAP §4.
-    let (priv_hex, pub_hex) = crate::keys::generate_k256().map_err(|e| XrpcError::internal(e.to_string()))?;
     // Minimal account insert; duplicate handle/DID surfaces as 400.
     let insert = db
-        .prepare("INSERT INTO account (did, handle, email, email_confirmed, password_hash, signing_key_k256_priv_hex, signing_key_k256_pub_hex, status, active, created_at, updated_at) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, 'active', 1, ?7, ?7)")
+        .prepare("INSERT INTO account (did, handle, email, email_confirmed, password_hash, signing_key_k256_priv_hex, signing_key_k256_pub_hex, rotation_key_k256_priv_hex, status, active, created_at, updated_at) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, 'active', 1, ?8, ?8)")
         .bind(&{
             let email_js: worker::wasm_bindgen::JsValue = match req.email.clone() {
                 Some(e) if !e.trim().is_empty() => e.into(),
                 _ => worker::wasm_bindgen::JsValue::NULL,
             };
-            [did.clone().into(), req.handle.clone().into(), email_js, password_hash.into(), priv_hex.into(), pub_hex.into(), now.clone().into()]
+            [did.clone().into(), req.handle.clone().into(), email_js, password_hash.into(), priv_hex.into(), pub_hex.into(), rot_priv_hex.into(), now.clone().into()]
         })
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run()
@@ -153,6 +181,9 @@ async fn create_account(
     let out = crate::repo::commit_repo(&s.env, &did, vec![], vec![], None).await?;
     crate::firehose::emit_account(&s.env, &did, true, None).await?;
     crate::firehose::emit_sync(&s.env, &did, &out.rev, &out.commit, &out.commit_bytes).await?;
+    // Announce to relays (best-effort; a relay that misses this can still
+    // discover the PDS via requestCrawl or handle resolution).
+    let _ = crate::routes_sync::notify_crawlers(&s.env, &cfg).await;
 
     // Compat tokens: HS256-signed JWTs (OAuth DPoP tokens come from /oauth/token).
     let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &did)?;

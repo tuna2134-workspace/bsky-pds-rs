@@ -2,8 +2,8 @@
 //! Spec: /specs/sync. WebSocket `subscribeRepos` is served as a
 //! poll-compatible JSON view (Workers WS upgrade staged in ROADMAP).
 
-use axum::{extract::{Query, State}, Json};
-use axum::routing::get;
+use axum::{extract::{Query, State}, http::HeaderMap, Json};
+use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use worker::Env;
@@ -24,6 +24,7 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.sync.getRecord", get(get_record_sync))
         // NOTE: listBlobs/getBlob live in blob_router (R2-backed). Do not re-register here.
         .route("/xrpc/com.atproto.sync.subscribeRepos", get(subscribe_repos))
+        .route("/xrpc/com.atproto.sync.requestCrawl", post(request_crawl))
         .route("/xrpc/com.atproto.sync.getLatestCommit", get(get_latest_commit))
         .with_state(SyncState { env })
 }
@@ -255,4 +256,60 @@ async fn get_latest_commit(State(s): State<SyncState>, Query(q): Query<DidParam>
         .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
     let Some(r) = root else { return Err(XrpcError::not_found("RepoNotFound", "no repo root")); };
     Ok(Json(serde_json::json!({"cid": r.commit_cid, "rev": r.rev})))
+}
+
+// ---------- requestCrawl ----------
+
+#[derive(serde::Deserialize)]
+struct CrawlReq {
+    #[serde(rename = "hostname")]
+    hostname: String,
+}
+
+/// Ask this PDS to announce itself to its configured crawlers/relays
+/// (`PDS_CRAWLERS`). Called automatically on account creation; relays and
+/// admins can re-trigger it here (authenticated to avoid amplification).
+#[worker::send]
+async fn request_crawl(
+    State(s): State<SyncState>,
+    headers: HeaderMap,
+    Json(req): Json<CrawlReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    // Any authenticated caller may trigger; the announcement always names
+    // OUR hostname, so this cannot be abused to crawl third parties... unless
+    // the caller passes another hostname — pin to our own.
+    let _ = crate::auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.sync.requestCrawl").await?;
+    if req.hostname != cfg.hostname {
+        return Err(XrpcError::bad_request("InvalidHostname", "can only announce our own hostname"));
+    }
+    let notified = notify_crawlers(&s.env, &cfg).await;
+    Ok(Json(serde_json::json!({ "notified": notified })))
+}
+
+/// Best-effort announce to every configured crawler. Returns hosts that
+/// accepted (2xx). Failures are swallowed (logged by the platform).
+pub async fn notify_crawlers(_env: &worker::Env, cfg: &pds_env::PdsEnv) -> Vec<String> {
+    use worker::{Fetch, Method, Request, RequestInit};
+    let mut ok = Vec::new();
+    let crawlers: Vec<&str> = cfg
+        .crawlers
+        .split([',', ' ', '\n'])
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    for crawler in crawlers {
+        let url = format!("{crawler}/xrpc/com.atproto.sync.requestCrawl?hostname={}", cfg.hostname);
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get);
+        let req = match Request::new_with_init(&url, &init) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        match Fetch::Request(req).send().await {
+            Ok(resp) if (200..300).contains(&resp.status_code()) => ok.push(crawler.to_string()),
+            _ => {}
+        }
+    }
+    ok
 }

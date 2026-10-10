@@ -37,14 +37,17 @@
 | getRepo / getRecord / getBlocks | ✅ | バイナリ CAR (`application/vnd.ipld.car`)。ハッシュ検証付き parse |
 | getBlocks | 🚧 | binary CAR 化待ち |
 | listBlobs / getBlob | ✅ | R2 実体 (blob_router) |
-| subscribeRepos | ✅ (ポーリング互換) | `?cursor=&limit=` で JSON。WS/CBOR は ROADMAP §2 |
-| requestCrawl | ⬜ | Relay 通知 (`PDS_CRAWLERS`) と同時実装 |
+| subscribeRepos | ✅ (ポーリング互換) | `?cursor=&limit=` で JSON。`blocks` は base64 CAR slice。WS/CBOR は ROADMAP §2 |
+| requestCrawl | ✅ | 自ホスト名の announce を crawlers へ best-effort 転送。作成時にも自動通知 |
 
 ## identity (`com.atproto.identity.*`)
 
 | NSID | 状態 | 備考 |
 |---|---|---|
-| resolveHandle | ✅ | 自 PDS の handle→DID |
+| resolveHandle | ✅ | 自 PDS の handle→DID (DB 権威) |
+| `/.well-known/atproto-did` | ✅ | Host 別 (ワイルドカード想定) の handle→DID |
+| atproto-proxy 転送 | ✅ | 未定義 `/xrpc/*` + ヘッダで他サービスへ転送。ES256K サービス JWT・SSRF ガード |
+| PLC 登録 | ✅ | 公開 handle は genesis+submit で実 `did:plc`。loopback は dev DID |
 | updateHandle | ✅ | 要認証 |
 | getRecommendedDidCredentials | 🚧 | PLC 鍵連携と同時実装 |
 | signPlcOperation / submitPlcOperation / requestPlcOperationSignature | ⬜ | PLC 連携 (ROADMAP §4) |

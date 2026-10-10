@@ -1,5 +1,6 @@
 use axum::{http::{HeaderValue, Method}, routing::get, Extension, Router};
 use tower_service::Service;
+use crate::proxy::proxy_fallback;
 use worker::*;
 
 pub mod atproto;
@@ -8,10 +9,12 @@ pub mod car;
 pub mod cbor;
 pub mod cid;
 pub mod firehose;
+pub mod identity;
 pub mod keys;
 pub mod mst;
 pub mod oauth;
 pub mod pds_env;
+pub mod proxy;
 pub mod repo;
 pub mod routes_misc;
 pub mod routes_repo;
@@ -30,6 +33,7 @@ fn router(env: Env) -> Router {
         .merge(routes_misc::blob_router(env.clone()))
         .merge(routes_misc::admin_router(env.clone()))
         .merge(routes_misc::oauth_router(env.clone()))
+        .fallback(proxy_fallback)
         .layer(Extension(env.clone()))
 }
 
