@@ -151,6 +151,7 @@ async fn create_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
+    repo::require_active(&s.env, &caller.did).await?;
     if !atproto::nsid::validate(&req.collection) {
         return Err(XrpcError::bad_request("InvalidNsid", "collection must be a valid NSID"));
     }
@@ -264,6 +265,7 @@ async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): J
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
+    repo::require_active(&s.env, &caller.did).await?;
     if !atproto::nsid::validate(&req.collection) || !atproto::record_key::validate(&req.rkey) {
         return Err(XrpcError::bad_request("InvalidRequest", "bad collection or rkey"));
     }
@@ -320,6 +322,7 @@ async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
+    repo::require_active(&s.env, &caller.did).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     if let Some(expected) = req.swap_record.as_deref() {
         let cur: Option<ExistsRow> = db.prepare("SELECT cid AS cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
@@ -420,6 +423,7 @@ async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req):
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
+    repo::require_active(&s.env, &caller.did).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let now = pds_env::now_iso();
     let mut ops = Vec::new();

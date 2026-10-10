@@ -15,7 +15,7 @@
 | createInviteCode(s) | ✅ | 管理者トークン必須 |
 | requestPasswordReset / resetPassword | 🚧 | SMTP 配線と同時実装 |
 | checkAccountStatus | 🚧 | |
-| activateAccount / deactivateAccount / deleteAccount | ⬜ | アカウント LC と同時実装 |
+| activateAccount / deactivateAccount | ✅ | 自アカウントの停止・再開。`#account` 発火・非 active は書き込み不可 |
 | confirmEmail / requestEmailConfirmation / requestEmailUpdate / updateEmail | ⬜ | SMTP と同時実装 |
 | getServiceAuth / refreshAppPassword 相当 | ⬜ | service JWT 発行として実装予定 |
 
@@ -37,7 +37,7 @@
 | getRepo / getRecord / getBlocks | ✅ | バイナリ CAR (`application/vnd.ipld.car`)。ハッシュ検証付き parse |
 | getBlocks | 🚧 | binary CAR 化待ち |
 | listBlobs / getBlob | ✅ | R2 実体 (blob_router) |
-| subscribeRepos | ✅ (ポーリング互換) | `?cursor=&limit=` で JSON。`blocks` は base64 CAR slice。WS/CBOR は ROADMAP §2 |
+| subscribeRepos | ✅ | WebSocket (event-stream v0: header+payload CBOR 連結)。`cursor` 再開・`FutureCursor`・ポーリング JSON 互換も維持 |
 | requestCrawl | ✅ | 自ホスト名の announce を crawlers へ best-effort 転送。作成時にも自動通知 |
 
 ## identity (`com.atproto.identity.*`)

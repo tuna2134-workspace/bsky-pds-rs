@@ -260,3 +260,25 @@ pub async fn export_repo(env: &Env, did: &str) -> XrpcResult<RepoExport> {
     let car = mst::build_car(&commit_cid, &blocks);
     Ok(RepoExport { rev: root_row.rev, root: tree.root, commit: commit_cid, commit_bytes, car })
 }
+
+/// Reject writes for inactive accounts (deactivated/deleted/takendown).
+pub(crate) async fn require_active(env: &Env, did: &str) -> XrpcResult<()> {
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct ActiveRow {
+        active: i64,
+        status: String,
+    }
+    let row: Option<ActiveRow> = db
+        .prepare("SELECT active, status FROM account WHERE did = ?1")
+        .bind(&[did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    match row {
+        Some(r) if r.active == 1 => Ok(()),
+        Some(r) => Err(XrpcError::forbidden("AccountDeactivated", format!("account is {}", r.status))),
+        None => Err(XrpcError::unauthorized("unknown account")),
+    }
+}

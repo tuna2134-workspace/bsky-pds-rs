@@ -92,12 +92,14 @@ async fn update_handle(State(s): State<IdentityState>, headers: HeaderMap, Json(
         }
     }
     let now = pds_env::now_iso();
+    let handle = req.handle.clone();
     db.prepare("UPDATE account SET handle = ?1, updated_at = ?2 WHERE did = ?3")
-        .bind(&[req.handle.into(), now.into(), caller.did.into()])
+        .bind(&[req.handle.into(), now.into(), caller.did.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run()
         .await
         .map_err(|_| XrpcError::bad_request("InvalidHandle", "handle update failed"))?;
+    crate::firehose::emit_identity(&s.env, &caller.did, Some(&handle)).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -158,6 +160,7 @@ pub fn blob_router(env: Env) -> Router {
 #[worker::send]
 async fn upload_blob(State(s): State<BlobState>, headers: HeaderMap, body: axum::body::Bytes) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.uploadBlob").await?;
+    crate::repo::require_active(&s.env, &caller.did).await?;
     let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     if body.len() > cfg.blob_upload_limit {
         return Err(XrpcError::too_large("blob exceeds PDS_BLOB_UPLOAD_LIMIT"));

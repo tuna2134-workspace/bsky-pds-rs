@@ -1,4 +1,4 @@
-use axum::{http::{HeaderValue, Method}, routing::get, Extension, Router};
+use axum::{http::{HeaderValue, Method}, response::IntoResponse, routing::get, Extension, Router};
 use tower_service::Service;
 use crate::proxy::proxy_fallback;
 use worker::*;
@@ -9,6 +9,7 @@ pub mod car;
 pub mod cbor;
 pub mod cid;
 pub mod firehose;
+pub mod firehose_ws;
 pub mod identity;
 pub mod keys;
 pub mod mst;
@@ -43,6 +44,21 @@ async fn fetch(
     env: Env,
     _ctx: Context,
 ) -> Result<axum::http::Response<axum::body::Body>> {
+    // Native WebSocket firehose (event-stream v0). Plain GETs without an
+    // upgrade fall through to the poll-compatible JSON handler below.
+    if req.method() == Method::GET
+        && req.uri().path() == "/xrpc/com.atproto.sync.subscribeRepos"
+        && crate::firehose_ws::is_ws_upgrade(&req)
+    {
+        return match crate::firehose_ws::accept(env, &req).await {
+            Ok(res) => Ok(res),
+            Err(e) => Ok(axum::Json(serde_json::json!({
+                "error": "InternalError",
+                "message": e.to_string(),
+            }))
+            .into_response()),
+        };
+    }
     // Attach permissive CORS preflight at the edge (simple, spec-encouraged).
     if req.method() == Method::OPTIONS {
         let mut res = axum::http::Response::new(axum::body::Body::empty());

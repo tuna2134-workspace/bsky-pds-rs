@@ -30,7 +30,8 @@
 
 ## 2. Sync / Firehose (Spec: [sync](https://atproto.com/specs/sync), [event-stream](https://atproto.com/specs/event-stream))
 
-- [ ] `#commit/#sync/#identity/#account` の CBOR + WebSocket 本体 (`wss://…/subscribeRepos?cursor=`)
+- [x] `#commit/#sync/#identity/#account` の CBOR + WebSocket 本体 (`wss://…/subscribeRepos?cursor=`)。ポーリング JSON 互換も維持。raw-socket 自前クライアントで E2E (`scripts/e2e_firehose.py`)
+- [x] `#identity` 発火 (作成時・handle 変更時)
 - [ ] `seq` 永続化の競合対策 (D1 単調採番の検証・Relay desync 修復手順の文書化)
 - [x] `Atproto-Repo-Rev` レスポンスヘッダ (全 repo 書き込みに付与)
 - [ ] record-level resync ワーカー設計 (外部 Relay 向けは別サービス)
@@ -57,6 +58,7 @@
 - [x] PLC genesis 生成・low-S 署名・DID 計算・submit + rotation 鍵保存。公開 handle の signup で実登録 (`scripts/e2e_plc.py` がスタブ相手に検証)。loopback は dev DID
 - [x] Relay 通知: 作成時 + `requestCrawl` 経由の best-effort announce (`PDS_CRAWLERS`)
 - [ ] PLC 監査ログ連携・rotation 鍵の secret store 移管・`PDS_PLC_ROTATION_KEY_*` 運用
+- [x] activate/deactivate (自アカウント停止・再開 + `#account` 伝播・書き込み遮断)
 - [ ] アカウント移行フロー (`#identity/#account` 発火順・旧/新 PDS 状態遷移)
 - [ ] 取下げ/停止/削除のホスティング状態伝播
 

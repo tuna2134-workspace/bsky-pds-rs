@@ -26,6 +26,8 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.server.requestPasswordReset", post(not_implemented))
         .route("/xrpc/com.atproto.server.resetPassword", post(not_implemented))
         .route("/xrpc/com.atproto.server.checkAccountStatus", get(not_implemented_get))
+        .route("/xrpc/com.atproto.server.deactivateAccount", post(deactivate_account))
+        .route("/xrpc/com.atproto.server.activateAccount", post(activate_account))
         .with_state(ServerState { env })
 }
 
@@ -180,6 +182,7 @@ async fn create_account(
     // Genesis: empty repo, signed commit, #account + #sync firehose events.
     let out = crate::repo::commit_repo(&s.env, &did, vec![], vec![], None).await?;
     crate::firehose::emit_account(&s.env, &did, true, None).await?;
+    crate::firehose::emit_identity(&s.env, &did, Some(&req.handle)).await?;
     crate::firehose::emit_sync(&s.env, &did, &out.rev, &out.commit, &out.commit_bytes).await?;
     // Announce to relays (best-effort; a relay that misses this can still
     // discover the PDS via requestCrawl or handle resolution).
@@ -465,4 +468,46 @@ async fn not_implemented() -> XrpcError {
 #[worker::send]
 async fn not_implemented_get() -> XrpcError {
     XrpcError::not_implemented("endpoint planned (see ROADMAP)")
+}
+
+// --- activate / deactivate (account lifecycle) ---
+
+/// Deactivate your own account: content stops being redistributed
+/// (`active: false`, `status: deactivated`) and a `#account` event fires.
+#[worker::send]
+async fn deactivate_account(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let _ = body;
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.deactivateAccount").await?;
+    set_account_status(&s.env, &caller.did, false, "deactivated").await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// Reactivate your own deactivated account.
+#[worker::send]
+async fn activate_account(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let _ = body;
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.activateAccount").await?;
+    set_account_status(&s.env, &caller.did, true, "active").await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+async fn set_account_status(env: &worker::Env, did: &str, active: bool, status: &str) -> XrpcResult<()> {
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let now = pds_env::now_iso();
+    db.prepare("UPDATE account SET active = ?1, status = ?2, updated_at = ?3 WHERE did = ?4")
+        .bind(&[(if active { 1.0 } else { 0.0 }).into(), status.into(), now.into(), did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    crate::firehose::emit_account(env, did, active, if active { None } else { Some(status) }).await?;
+    Ok(())
 }
