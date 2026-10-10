@@ -154,18 +154,28 @@ def main():
                     {"email": f"{HANDLE}@example.com", "token": tok})
     check("token single-use", st == 400, str(body)[:80])
 
-    # updateEmail staged flow
+    # updateEmail: confirmed accounts must present the requestEmailUpdate token
     new_email = f"new-{HANDLE}@example.com"
-    st, _ = call("POST", "/xrpc/com.atproto.server.updateEmail", {"email": new_email}, auth=auth)
-    check("updateEmail staged", st == 200, "")
+    st, body = call("POST", "/xrpc/com.atproto.server.updateEmail", {"email": new_email}, auth=auth)
+    check("updateEmail TokenRequired", st == 400 and body.get("error") == "TokenRequired", str(body)[:60])
+    st, body = call("POST", "/xrpc/com.atproto.server.requestEmailUpdate", {}, auth=auth)
+    check("requestEmailUpdate", st == 200 and body.get("tokenRequired") is True, str(body)[:60])
     tok2 = last_token()
     st, _ = call("POST", "/xrpc/com.atproto.server.updateEmail",
                  {"email": new_email, "token": tok2}, auth=auth)
-    check("updateEmail confirmed", st == 200, "")
+    check("updateEmail with token", st == 200, "")
     st, gsess = call("GET", "/xrpc/com.atproto.server.getSession", auth=auth)
-    check("email applied", st == 200 and gsess.get("email") == new_email, str(gsess)[:120])
+    check("email rotated unconfirmed", st == 200 and gsess.get("email") == new_email
+          and gsess.get("emailConfirmed") is not True, str(gsess)[:120])
+    # confirm the new address through the standard confirmation flow
+    st, _ = call("POST", "/xrpc/com.atproto.server.requestEmailConfirmation", {}, auth=auth)
+    check("requestEmailConfirmation#2", st == 200, "")
+    tok2b = last_token()
+    st, _ = call("POST", "/xrpc/com.atproto.server.confirmEmail",
+                 {"email": new_email, "token": tok2b})
+    check("confirm new address", st == 200, "")
 
-    # password reset
+    # password reset (uses the confirmed new address)
     st, _ = call("POST", "/xrpc/com.atproto.server.requestPasswordReset", {"email": new_email})
     check("requestPasswordReset (always 200)", st == 200, "")
     tok3 = last_token()
@@ -192,8 +202,13 @@ def main():
     check("listReposByCollection", st == 200 and did in dids, f"n={len(dids)}")
 
     # deleteAccount
+    st, _ = call("POST", "/xrpc/com.atproto.server.requestAccountDelete", {}, auth="Bearer " + token2)
+    check("requestAccountDelete", st == 200, "")
+    import re as _re
+    t = "\n".join(MAILBOX[-1]["body"])
+    tokd = _re.search(r"\n([A-Za-z0-9_-]{43})\n", "\n" + t + "\n").group(1)
     st, _ = call("POST", "/xrpc/com.atproto.server.deleteAccount",
-                 {"password": "brand-new-pw-long"}, auth="Bearer " + token2)
+                 {"did": did, "password": "brand-new-pw-long", "token": tokd}, auth="Bearer " + token2)
     check("deleteAccount", st == 200, "")
     st, body = call("GET", f"/xrpc/com.atproto.sync.getRepoStatus?did={did}")
     check("repo gone", st == 404, f"{st} {str(body)[:80]}")

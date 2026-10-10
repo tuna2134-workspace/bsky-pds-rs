@@ -59,7 +59,8 @@
 - [x] Relay 通知: 作成時 + `requestCrawl` 経由の best-effort announce (`PDS_CRAWLERS`)
 - [ ] PLC 監査ログ連携・rotation 鍵の secret store 移管・`PDS_PLC_ROTATION_KEY_*` 運用
 - [x] activate/deactivate (自アカウント停止・再開 + `#account` 伝播・書き込み遮断)
-- [ ] アカウント移行フロー (`#identity/#account` 発火順・旧/新 PDS 状態遷移)
+- [x] アカウント移行ハンドシェイク (reserveSigningKey→PLC 更新→createAccount 引継ぎ・移行離脱時の自動 deactive)
+- [ ] 完全な CAR 移行インポート (export→import の自動化・`#sync` 再送)
 - [ ] 取下げ/停止/削除のホスティング状態伝播
 
 ## 5. AppView/Relay 連携・運用

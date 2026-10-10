@@ -1,7 +1,7 @@
 //! `com.atproto.server.*` — account/session/invite endpoints.
 //! Lexicon sources: bluesky-social/atproto `lexicons/com/atproto/server/*`.
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::{Query, State}, http::HeaderMap, Json};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
@@ -29,9 +29,18 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.server.confirmEmail", post(confirm_email))
         .route("/xrpc/com.atproto.server.updateEmail", post(update_email))
         .route("/xrpc/com.atproto.server.deleteAccount", post(delete_account))
-        .route("/xrpc/com.atproto.server.checkAccountStatus", get(not_implemented_get))
         .route("/xrpc/com.atproto.server.deactivateAccount", post(deactivate_account))
         .route("/xrpc/com.atproto.server.activateAccount", post(activate_account))
+        .route("/xrpc/com.atproto.server.deleteSession", post(delete_session))
+        .route("/xrpc/com.atproto.server.createAppPassword", post(create_app_password))
+        .route("/xrpc/com.atproto.server.listAppPasswords", get(list_app_passwords))
+        .route("/xrpc/com.atproto.server.revokeAppPassword", post(revoke_app_password))
+        .route("/xrpc/com.atproto.server.getServiceAuth", get(get_service_auth))
+        .route("/xrpc/com.atproto.server.checkAccountStatus", get(check_account_status))
+        .route("/xrpc/com.atproto.server.requestEmailUpdate", post(request_email_update))
+        .route("/xrpc/com.atproto.server.requestAccountDelete", post(request_account_delete))
+        .route("/xrpc/com.atproto.server.getAccountInviteCodes", get(get_account_invite_codes))
+        .route("/xrpc/com.atproto.server.reserveSigningKey", post(reserve_signing_key))
         .with_state(ServerState { env })
 }
 
@@ -110,10 +119,28 @@ async fn create_account(
     if !atproto::handle::validate(&req.handle) {
         return Err(XrpcError::bad_request("InvalidHandle", "handle syntax invalid"));
     }
-    if cfg.invite_required && req.invite_code.is_none() {
-        // Admin token can bypass invite requirement.
-        if auth::check_admin(&headers, cfg.admin_password.as_deref()).is_err() {
-            return Err(XrpcError::bad_request("InvalidInviteCode", "invite code required"));
+    let admin_bypass = auth::check_admin(&headers, cfg.admin_password.as_deref()).is_ok();
+    if cfg.invite_required && req.invite_code.is_none() && !admin_bypass {
+        return Err(XrpcError::bad_request("InvalidInviteCode", "invite code required"));
+    }
+    if let Some(code) = req.invite_code.as_deref() {
+        if !admin_bypass {
+            let db0 = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+            #[derive(serde::Deserialize)]
+            struct InviteRow {
+                used_by: Option<String>,
+            }
+            let row: Option<InviteRow> = db0
+                .prepare("SELECT used_by FROM invite_code WHERE code = ?1")
+                .bind(&[code.into()])
+                .map_err(|e| XrpcError::internal(e.to_string()))?
+                .first(None)
+                .await
+                .map_err(|e| XrpcError::internal(e.to_string()))?;
+            match row {
+                Some(r) if r.used_by.is_none() => {}
+                _ => return Err(XrpcError::bad_request("InvalidInviteCode", "bad or used invite code")),
+            }
         }
     }
     let password = req.password.ok_or_else(|| {
@@ -166,6 +193,31 @@ async fn create_account(
     };
 
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    // Adopt a reserved signing key when migrating in (reserveSigningKey).
+    let mut priv_hex = priv_hex;
+    let mut pub_hex = pub_hex;
+    #[derive(serde::Deserialize)]
+    struct ReservedRow {
+        priv_hex: String,
+        pub_hex: String,
+    }
+    let reserved: Option<ReservedRow> = db
+        .prepare("SELECT priv_hex, pub_hex FROM reserved_key WHERE did = ?1")
+        .bind(&[did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    if let Some(r) = reserved {
+        priv_hex = r.priv_hex;
+        pub_hex = r.pub_hex;
+        db.prepare("DELETE FROM reserved_key WHERE did = ?1")
+            .bind(&[did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .run()
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+    }
     let now = pds_env::now_iso();
     // Minimal account insert; duplicate handle/DID surfaces as 400.
     let insert = db
@@ -183,6 +235,17 @@ async fn create_account(
     if insert.is_err() {
         return Err(XrpcError::bad_request("DuplicateAccount", "handle or DID already exists"));
     }
+    if let Some(code) = req.invite_code.as_deref() {
+        if !admin_bypass {
+            let now_used = pds_env::now_iso();
+            db.prepare("UPDATE invite_code SET used_by = ?1, used_at = ?2 WHERE code = ?3")
+                .bind(&[did.clone().into(), now_used.into(), code.into()])
+                .map_err(|e| XrpcError::internal(e.to_string()))?
+                .run()
+                .await
+                .map_err(|e| XrpcError::internal(e.to_string()))?;
+        }
+    }
     // Genesis: empty repo, signed commit, #account + #sync firehose events.
     let out = crate::repo::commit_repo(&s.env, &did, vec![], vec![], None).await?;
     crate::firehose::emit_account(&s.env, &did, true, None).await?;
@@ -193,7 +256,7 @@ async fn create_account(
     let _ = crate::routes_sync::notify_crawlers(&s.env, &cfg).await;
 
     // Compat tokens: HS256-signed JWTs (OAuth DPoP tokens come from /oauth/token).
-    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &did)?;
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &did, 0, None)?;
 
     Ok(Json(CreateAccountResp {
         did: did.clone(),
@@ -207,24 +270,30 @@ async fn create_account(
 }
 
 /// Issue a compat session pair (HS256, `PDS_JWT_SECRET`). Access 1h, refresh 7d.
-fn issue_compat_pair(env: &worker::Env, did: &str) -> XrpcResult<(String, String)> {
+/// `app_password`: None for primary password, Some(privileged) for app passwords.
+fn issue_compat_pair(
+    env: &worker::Env,
+    did: &str,
+    epoch: i64,
+    app_password: Option<bool>,
+) -> XrpcResult<(String, String)> {
     let cfg = pds_env::PdsEnv::from_env(env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let secret = cfg.jwt_secret.ok_or_else(|| {
         XrpcError::internal("PDS_JWT_SECRET not configured; compat sessions disabled")
     })?;
     let now = (worker::Date::now().as_millis() / 1000) as i64;
-    let access = crate::keys::sign_jwt_hs256(
-        &secret,
-        "at+jwt",
-        &serde_json::json!({"iss": format!("https://{}", cfg.hostname), "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 3600}),
-    )
-    .map_err(|e| XrpcError::internal(e.to_string()))?;
-    let refresh = crate::keys::sign_jwt_hs256(
-        &secret,
-        "refresh+jwt",
-        &serde_json::json!({"iss": format!("https://{}", cfg.hostname), "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 7 * 86400}),
-    )
-    .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let mut access_claims = serde_json::json!({"iss": format!("https://{}", cfg.hostname), "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 3600, "epoch": epoch});
+    let mut refresh_claims = serde_json::json!({"iss": format!("https://{}", cfg.hostname), "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 7 * 86400, "epoch": epoch});
+    if let Some(privileged) = app_password {
+        access_claims["appPassword"] = serde_json::Value::Bool(true);
+        access_claims["privileged"] = serde_json::Value::Bool(privileged);
+        refresh_claims["appPassword"] = serde_json::Value::Bool(true);
+        refresh_claims["privileged"] = serde_json::Value::Bool(privileged);
+    }
+    let access = crate::keys::sign_jwt_hs256(&secret, "at+jwt", &access_claims)
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let refresh = crate::keys::sign_jwt_hs256(&secret, "refresh+jwt", &refresh_claims)
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
     Ok((access, refresh))
 }
 
@@ -264,7 +333,7 @@ async fn create_session_compat(
 ) -> XrpcResult<Json<SessionResp>> {
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
-        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, active FROM account WHERE handle = ?1 OR email = ?1 OR did = ?1")
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active FROM account WHERE handle = ?1 OR email = ?1 OR did = ?1")
         .bind(&[req.identifier.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None)
@@ -274,14 +343,37 @@ async fn create_session_compat(
     let Some(a) = row else {
         return Err(bad());
     };
+    // Primary password first, then app passwords (reduced privilege surface).
     let stored = a.password_hash.clone().unwrap_or_default();
-    if stored.is_empty() || !crate::oauth::verify_password(&stored, &req.password) {
-        return Err(bad());
+    let app_password: Option<bool>;
+    if !stored.is_empty() && crate::oauth::verify_password(&stored, &req.password) {
+        app_password = None;
+    } else {
+        #[derive(serde::Deserialize)]
+        struct AppPwRow {
+            password_hash: String,
+            privileged: i64,
+        }
+        let pwrow: Option<AppPwRow> = db
+            .prepare("SELECT password_hash, privileged FROM app_password WHERE did = ?1")
+            .bind(&[a.did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .all()
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .results::<AppPwRow>()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|r| crate::oauth::verify_password(&r.password_hash, &req.password));
+        match pwrow {
+            Some(r) => app_password = Some(r.privileged == 1),
+            None => return Err(bad()),
+        }
     }
     if a.active == 0 {
         return Err(XrpcError::forbidden("AccountDeactivated", "account is not active"));
     }
-    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did)?;
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did, a.session_epoch, app_password)?;
     Ok(Json(SessionResp {
         did: a.did.clone(),
         handle: a.handle,
@@ -315,9 +407,12 @@ async fn refresh_session_compat(
     if (worker::Date::now().as_millis() / 1000) as i64 > exp + 30 {
         return Err(XrpcError::unauthorized("refresh token expired"));
     }
+    let token_epoch = payload.get("epoch").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let token_app_pw = payload.get("appPassword").and_then(|v| v.as_bool()).unwrap_or(false);
+    let token_priv = payload.get("privileged").and_then(|v| v.as_bool()).unwrap_or(false);
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
-        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, active FROM account WHERE did = ?1")
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active FROM account WHERE did = ?1")
         .bind(&[did.into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None)
@@ -326,7 +421,11 @@ async fn refresh_session_compat(
     let Some(a) = row else {
         return Err(XrpcError::unauthorized("unknown account"));
     };
-    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did)?;
+    if a.session_epoch != token_epoch {
+        return Err(XrpcError::unauthorized("session revoked"));
+    }
+    let app_password = token_app_pw.then_some(token_priv);
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did, a.session_epoch, app_password)?;
     Ok(Json(SessionResp {
         did: a.did.clone(),
         handle: a.handle,
@@ -338,7 +437,6 @@ async fn refresh_session_compat(
     }))
 }
 
-#[worker::send]
 #[worker::send]
 async fn refresh_session_post(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<SessionResp>> {
     refresh_session_compat(State(s), headers).await
@@ -363,7 +461,7 @@ async fn get_session(State(s): State<ServerState>, headers: HeaderMap) -> XrpcRe
     let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.server.getSession").await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
-        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, active FROM account WHERE did = ?1")
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active FROM account WHERE did = ?1")
         .bind(&[caller.did.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None)
@@ -394,6 +492,7 @@ struct AccountRow {
     email: Option<String>,
     email_confirmed: i64,
     password_hash: Option<String>,
+    session_epoch: i64,
     active: i64,
 }
 
@@ -701,9 +800,15 @@ async fn confirm_email(State(s): State<ServerState>, Json(req): Json<ConfirmEmai
 struct UpdateEmailReq {
     email: String,
     #[serde(default)]
+    email_auth_factor: Option<bool>,
+    #[serde(default)]
     token: Option<String>,
 }
 
+/// Lexicon behavior: accounts with a CONFIRMED address must present the
+/// `requestEmailUpdate` token (`TokenRequired` otherwise); unconfirmed
+/// accounts may rotate freely. Successful changes reset confirmation and
+/// trigger a fresh confirmation code to the new address.
 #[worker::send]
 async fn update_email(
     State(s): State<ServerState>,
@@ -711,27 +816,46 @@ async fn update_email(
     Json(req): Json<UpdateEmailReq>,
 ) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.updateEmail").await?;
+    auth::require_full_password(&caller, "updateEmail")?;
     if !valid_email(&req.email) {
         return Err(XrpcError::bad_request("InvalidEmail", "bad email address"));
     }
-    // With a confirmation token, apply immediately; otherwise stage + send code.
-    if let Some(token) = req.token.as_deref() {
-        let (did, token_email) = consume_email_token(&s.env, "update", token).await?;
-        if did != caller.did || token_email != req.email {
+    let _ = req.email_auth_factor;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct ConfRow {
+        email_confirmed: i64,
+        email: Option<String>,
+    }
+    let row: Option<ConfRow> = db
+        .prepare("SELECT email_confirmed, email FROM account WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let Some(acct) = row else {
+        return Err(XrpcError::unauthorized("unknown account"));
+    };
+    if acct.email_confirmed == 1 {
+        let token = req.token.as_deref().ok_or_else(|| XrpcError::bad_request("TokenRequired", "email update token required"))?;
+        let (did, _) = consume_email_token(&s.env, "update", token).await
+            .map_err(|_| XrpcError::bad_request("InvalidToken", "bad or expired token"))?;
+        if did != caller.did {
             return Err(XrpcError::bad_request("InvalidToken", "token does not match"));
         }
-        let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
-        db.prepare("UPDATE account SET email = ?1, email_confirmed = 1 WHERE did = ?2")
-            .bind(&[req.email.clone().into(), caller.did.into()])
+    }
+    if acct.email.as_deref() != Some(req.email.as_str()) {
+        db.prepare("UPDATE account SET email = ?1, email_confirmed = 0 WHERE did = ?2")
+            .bind(&[req.email.clone().into(), caller.did.clone().into()])
             .map_err(|e| XrpcError::internal(e.to_string()))?
             .run()
             .await
             .map_err(|e| XrpcError::internal(e.to_string()))?;
-        return Ok(Json(serde_json::json!({})));
+        let token = issue_email_token(&s.env, &caller.did, "confirm", Some(&req.email), 24 * 3600).await?;
+        let text = format!("Confirm your new email address with this code:\n\n{token}\n\nIt expires in 24 hours.\n");
+        crate::email::send_email(&s.env, &req.email, "Confirm your new email", &text).await?;
     }
-    let token = issue_email_token(&s.env, &caller.did, "update", Some(&req.email), 24 * 3600).await?;
-    let text = format!("Confirm your new email address with this code:\n\n{token}\n\nIt expires in 24 hours.\n");
-    crate::email::send_email(&s.env, &req.email, "Confirm your new email", &text).await?;
     Ok(Json(serde_json::json!({})))
 }
 
@@ -785,15 +909,14 @@ async fn reset_password(State(s): State<ServerState>, Json(req): Json<ResetPassw
 
 #[derive(serde::Deserialize)]
 struct DeleteAccountReq {
-    #[serde(default)]
-    did: Option<String>,
-    #[serde(default)]
-    password: Option<String>,
+    did: String,
+    password: String,
+    token: String,
 }
 
-/// Delete your own account (password required): wipes records, blobs, repo
-/// state and sessions, then emits `#account` deleted. PLC tombstoning is a
-/// separate rotation-key operation (see ROADMAP §4).
+/// Lexicon-exact deletion: authenticated self + password + emailed token.
+/// Wipes records, blobs, repo state and sessions, then emits `#account`
+/// deleted. PLC tombstoning is a separate rotation-key operation (ROADMAP §4).
 #[worker::send]
 async fn delete_account(
     State(s): State<ServerState>,
@@ -801,10 +924,17 @@ async fn delete_account(
     Json(req): Json<DeleteAccountReq>,
 ) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.deleteAccount").await?;
-    let did = req.did.clone().unwrap_or_else(|| caller.did.clone());
-    if did != caller.did {
+    auth::require_full_password(&caller, "deleteAccount")?;
+    if req.did != caller.did {
         return Err(XrpcError::forbidden("AuthFailed", "can only delete your own account"));
     }
+    let (token_did, _) = consume_email_token(&s.env, "delete", &req.token)
+        .await
+        .map_err(|_| XrpcError::new(axum::http::StatusCode::BAD_REQUEST, "InvalidToken", "bad or expired token"))?;
+    if token_did != caller.did {
+        return Err(XrpcError::new(axum::http::StatusCode::BAD_REQUEST, "InvalidToken", "token does not match"));
+    }
+    let did = caller.did.clone();
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     #[derive(serde::Deserialize)]
     struct PwRow {
@@ -820,7 +950,7 @@ async fn delete_account(
     let Some(pw) = row else {
         return Err(XrpcError::not_found("AccountNotFound", "unknown account"));
     };
-    let password = req.password.ok_or_else(|| XrpcError::bad_request("InvalidPassword", "password required"))?;
+    let password = req.password;
     match pw.password_hash {
         Some(h) if crate::oauth::verify_password(&h, &password) => {}
         _ => return Err(XrpcError::new(axum::http::StatusCode::UNAUTHORIZED, "AuthenticationRequired", "bad password")),
@@ -841,6 +971,7 @@ async fn delete_account(
         "DELETE FROM firehose_event WHERE did = ?1",
         "DELETE FROM oauth_token WHERE did = ?1",
         "DELETE FROM email_token WHERE did = ?1",
+        "DELETE FROM app_password WHERE did = ?1",
         "DELETE FROM account WHERE did = ?1",
     ] {
         db.prepare(stmt)
@@ -852,4 +983,412 @@ async fn delete_account(
     }
     crate::firehose::emit_account(&s.env, &did, false, Some("deleted")).await?;
     Ok(Json(serde_json::json!({})))
+}
+
+// --- sessions: deleteSession (epoch revocation) ---
+
+/// Delete the compat session: bumps the account epoch so every previously
+/// issued HS256 token stops verifying. OAuth refresh sessions are unaffected
+/// (rotate via the token endpoint); pass `oauth: false` sessions only here
+/// by construction (DPoP tokens cannot call this compat endpoint usefully).
+#[worker::send]
+async fn delete_session(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.deleteSession").await?;
+    if caller.oauth {
+        return Err(XrpcError::bad_request("InvalidRequest", "OAuth sessions rotate via /oauth/token"));
+    }
+    auth::require_full_password(&caller, "deleteSession")?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    db.prepare("UPDATE account SET session_epoch = session_epoch + 1 WHERE did = ?1")
+        .bind(&[caller.did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({})))
+}
+
+// --- App Passwords ---
+
+fn new_app_password() -> String {
+    // 10 random bytes -> 16 base32 chars -> xxxx-xxxx-xxxx-xxxx.
+    let mut bytes = [0u8; 10];
+    let _ = getrandom::getrandom(&mut bytes);
+    let s = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &bytes).to_lowercase();
+    format!("{}-{}-{}-{}", &s[0..4], &s[4..8], &s[8..12], &s[12..16])
+}
+
+#[derive(serde::Deserialize)]
+struct CreateAppPasswordReq {
+    name: String,
+    #[serde(default)]
+    privileged: Option<bool>,
+}
+
+#[worker::send]
+async fn create_app_password(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateAppPasswordReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.createAppPassword").await?;
+    auth::require_full_password(&caller, "createAppPassword")?;
+    if req.name.is_empty() || req.name.len() > 64 {
+        return Err(XrpcError::bad_request("InvalidRequest", "bad app password name"));
+    }
+    let password = new_app_password();
+    let hash = crate::oauth::hash_password(&password)?;
+    let privileged = req.privileged.unwrap_or(false);
+    let now = pds_env::now_iso();
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let inserted = db
+        .prepare("INSERT INTO app_password (did, name, password_hash, privileged, created_at) VALUES (?1, ?2, ?3, ?4, ?5)")
+        .bind(&[
+            caller.did.into(),
+            req.name.clone().into(),
+            hash.into(),
+            (if privileged { 1.0 } else { 0.0 }).into(),
+            now.clone().into(),
+        ])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await;
+    if inserted.is_err() {
+        return Err(XrpcError::bad_request("DuplicateCreate", "an app password with this name exists"));
+    }
+    Ok(Json(serde_json::json!({
+        "name": req.name, "password": password, "createdAt": now, "privileged": privileged,
+    })))
+}
+
+#[worker::send]
+async fn list_app_passwords(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.server.listAppPasswords").await?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct PwRow {
+        name: String,
+        privileged: i64,
+        created_at: String,
+    }
+    let rows = db
+        .prepare("SELECT name, privileged, created_at FROM app_password WHERE did = ?1 ORDER BY created_at ASC")
+        .bind(&[caller.did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .all()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let mut passwords = Vec::new();
+    for r in rows.results::<PwRow>().unwrap_or_default() {
+        passwords.push(serde_json::json!({
+            "name": r.name, "createdAt": r.created_at, "privileged": r.privileged == 1,
+        }));
+    }
+    Ok(Json(serde_json::json!({ "passwords": passwords })))
+}
+
+#[derive(serde::Deserialize)]
+struct RevokeAppPasswordReq {
+    name: String,
+}
+
+#[worker::send]
+async fn revoke_app_password(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeAppPasswordReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.revokeAppPassword").await?;
+    auth::require_full_password(&caller, "revokeAppPassword")?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    db.prepare("DELETE FROM app_password WHERE did = ?1 AND name = ?2")
+        .bind(&[caller.did.into(), req.name.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({})))
+}
+
+// --- getServiceAuth ---
+
+#[derive(serde::Deserialize)]
+struct GetServiceAuthParam {
+    aud: String,
+    exp: Option<i64>,
+    lxm: Option<String>,
+}
+
+/// Mint an inter-service JWT for the caller (ES256K, account key).
+/// Used by clients that talk to AppViews/labelers through or past the PDS.
+#[worker::send]
+async fn get_service_auth(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Query(q): Query<GetServiceAuthParam>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.server.getServiceAuth").await?;
+    // aud is a DID or `did#service` reference.
+    let (aud_did, _frag) = match q.aud.split_once('#') {
+        Some((d, f)) if !d.is_empty() && !f.is_empty() => (d, Some(f)),
+        None if !q.aud.is_empty() => (q.aud.as_str(), None),
+        _ => return Err(XrpcError::bad_request("InvalidAud", "bad audience")),
+    };
+    if !crate::atproto::did::validate(aud_did) {
+        return Err(XrpcError::bad_request("InvalidAud", "audience must be a DID"));
+    }
+    if let Some(lxm) = q.lxm.as_deref() {
+        if !crate::atproto::nsid::validate(lxm) {
+            return Err(XrpcError::bad_request("InvalidLxm", "lxm must be an NSID"));
+        }
+    }
+    let now = (worker::Date::now().as_millis() / 1000) as i64;
+    let exp = q.exp.unwrap_or(now + 60);
+    if exp <= now {
+        return Err(XrpcError::new(axum::http::StatusCode::BAD_REQUEST, "BadExpiration", "expiration is in the past"));
+    }
+    if exp > now + 3600 {
+        return Err(XrpcError::new(axum::http::StatusCode::BAD_REQUEST, "BadExpiration", "expiration too far out (max 1h)"));
+    }
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let priv_hex = crate::repo::signing_key(&db, &caller.did).await?;
+    let jti = crate::keys::random_b64u32().map_err(|e| XrpcError::internal(e.to_string()))?;
+    let mut claims = serde_json::json!({
+        "iss": caller.did, "aud": q.aud, "iat": now, "exp": exp, "jti": jti,
+    });
+    if let Some(lxm) = q.lxm {
+        claims["lxm"] = serde_json::Value::String(lxm);
+    }
+    let token = crate::keys::sign_jwt_es256k(&priv_hex, &claims).map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({ "token": token })))
+}
+
+// --- checkAccountStatus ---
+
+/// Migration/recovery-oriented self status: repo pointers plus blob/index
+/// accounting. Requires auth, callable only about oneself.
+#[worker::send]
+async fn check_account_status(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.server.checkAccountStatus").await?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct StatusRow {
+        active: i64,
+    }
+    let row: Option<StatusRow> = db
+        .prepare("SELECT active FROM account WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let activated = matches!(&row, Some(r) if r.active == 1);
+    // validDid: syntax + local existence + (remote doc match when resolvable).
+    let mut valid_did = crate::atproto::did::validate(&caller.did) && row.is_some();
+    if valid_did && !caller.did.starts_with("did:plc:dev") {
+        match crate::identity::resolve_did(&s.env, &caller.did).await {
+            Ok(doc) => valid_did = doc.did == caller.did,
+            Err(_) => valid_did = false,
+        }
+    }
+    let exp = crate::repo::export_repo(&s.env, &caller.did).await?;
+    let (_, blocks) = crate::mst::parse_car(&exp.car).map_err(|e| XrpcError::internal(e.to_string()))?;
+    // records = blocks that are not MST nodes and not the commit.
+    let mut indexed_records = 0i64;
+    let mut node_count = 0i64;
+    for (cid, bytes) in &blocks {
+        if cid == &exp.commit {
+            continue;
+        }
+        if crate::mst::parse_node(bytes).is_ok() {
+            node_count += 1;
+        } else {
+            indexed_records += 1;
+        }
+    }
+    // Blobs: expected (rows) vs imported (present in R2).
+    #[derive(serde::Deserialize)]
+    struct BlobKey {
+        #[serde(rename = "k")]
+        k: String,
+    }
+    let blob_rows = db
+        .prepare("SELECT r2_key AS k FROM blob WHERE did = ?1")
+        .bind(&[caller.did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .all()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let keys: Vec<String> = blob_rows.results::<BlobKey>().unwrap_or_default().into_iter().map(|r| r.k).collect();
+    let expected_blobs = keys.len() as i64;
+    let mut imported_blobs = 0i64;
+    if let Ok(bucket) = s.env.bucket("BLOBS") {
+        for k in &keys {
+            if let Ok(Some(_)) = bucket.get(k).execute().await {
+                imported_blobs += 1;
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "activated": activated,
+        "validDid": valid_did,
+        "repoCommit": exp.commit.to_string(),
+        "repoRev": exp.rev,
+        "repoBlocks": 1 + node_count + indexed_records,
+        "indexedRecords": indexed_records,
+        "privateStateValues": 0,
+        "expectedBlobs": expected_blobs,
+        "importedBlobs": imported_blobs,
+    })))
+}
+
+
+// --- requestEmailUpdate (lexicon-aligned) ---
+
+/// Send an email-update token to the CURRENT address. Returns whether a
+/// token is required (always true once the address is confirmed).
+#[worker::send]
+async fn request_email_update(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.requestEmailUpdate").await?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct ERow {
+        email: Option<String>,
+    }
+    let row: Option<ERow> = db
+        .prepare("SELECT email FROM account WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let email = row.and_then(|r| r.email).unwrap_or_default();
+    if email.is_empty() {
+        return Ok(Json(serde_json::json!({ "tokenRequired": false })));
+    }
+    let token = issue_email_token(&s.env, &caller.did, "update", Some(&email), 24 * 3600).await?;
+    let text = format!("Use this code to authorize changing your account email:\n\n{token}\n\nIt expires in 24 hours.\n");
+    crate::email::send_email(&s.env, &email, "Authorize your email change", &text).await?;
+    Ok(Json(serde_json::json!({ "tokenRequired": true })))
+}
+
+// --- requestAccountDelete / deleteAccount (lexicon: did+password+token) ---
+
+#[worker::send]
+async fn request_account_delete(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.requestAccountDelete").await?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct ERow2 {
+        email: Option<String>,
+    }
+    let row: Option<ERow2> = db
+        .prepare("SELECT email FROM account WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let email = row.and_then(|r| r.email).unwrap_or_default();
+    if email.is_empty() {
+        return Err(XrpcError::bad_request("InvalidEmail", "no email on file; set one first"));
+    }
+    let token = issue_email_token(&s.env, &caller.did, "delete", None, 3600).await?;
+    let text = format!("Delete your account with this code:\n\n{token}\n\nIt expires in 1 hour. If you did not request this, ignore this message.\n");
+    crate::email::send_email(&s.env, &email, "Delete your account", &text).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+// --- invites: consumption + listing ---
+
+#[derive(serde::Deserialize)]
+struct GetAccountInviteCodesParam {
+    #[serde(default)]
+    #[serde(rename = "includeUsed")]
+    include_used: Option<bool>,
+    #[serde(default)]
+    #[serde(rename = "createAvailable")]
+    create_available: Option<bool>,
+}
+
+/// Codes redeemed by the calling account. (This PDS issues global invites;
+/// per-account earning quotas are out of scope.)
+#[worker::send]
+async fn get_account_invite_codes(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Query(q): Query<GetAccountInviteCodesParam>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.server.getAccountInviteCodes").await?;
+    let _ = q.create_available;
+    let include_used = q.include_used.unwrap_or(true);
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct CodeRow {
+        code: String,
+        used_by: Option<String>,
+        created_at: String,
+        used_at: Option<String>,
+    }
+    let rows = db
+        .prepare("SELECT code, used_by, created_at, used_at FROM invite_code WHERE used_by = ?1 ORDER BY created_at ASC")
+        .bind(&[caller.did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .all()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let mut codes = Vec::new();
+    for r in rows.results::<CodeRow>().unwrap_or_default() {
+        let used = r.used_by.is_some();
+        if used && !include_used {
+            continue;
+        }
+        codes.push(serde_json::json!({
+            "code": r.code,
+            "available": if used { 0 } else { 1 },
+            "disabled": false,
+            "forAccount": "admin",
+            "createdBy": "admin",
+            "createdAt": r.created_at,
+            "uses": r.used_by.map(|u| serde_json::json!([{"usedBy": u, "usedAt": r.used_at}])).unwrap_or(serde_json::json!([])),
+        }));
+    }
+    Ok(Json(serde_json::json!({ "codes": codes })))
+}
+
+// --- reserveSigningKey (migration handshake) ---
+
+#[derive(serde::Deserialize)]
+struct ReserveSigningKeyReq {
+    #[serde(default)]
+    did: Option<String>,
+}
+
+/// Reserve a repo signing key for a DID that is about to migrate here.
+/// Public (no auth): the key is useless without the matching private half,
+/// which only this PDS holds. `createAccount` adopts the reservation.
+#[worker::send]
+async fn reserve_signing_key(
+    State(s): State<ServerState>,
+    Json(req): Json<ReserveSigningKeyReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    if let Some(did) = req.did.as_deref() {
+        if !crate::atproto::did::validate(did) {
+            return Err(XrpcError::bad_request("InvalidDid", "bad DID"));
+        }
+    }
+    let (priv_hex, pub_hex) = crate::keys::generate_k256().map_err(|e| XrpcError::internal(e.to_string()))?;
+    let signing_did_key = crate::identity::did_key_encode(&pub_hex, &crate::keys::Curve::K256)
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    if let Some(did) = req.did {
+        let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+        let now = pds_env::now_iso();
+        db.prepare("INSERT INTO reserved_key (did, priv_hex, pub_hex, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(did) DO UPDATE SET priv_hex = excluded.priv_hex, pub_hex = excluded.pub_hex, created_at = excluded.created_at")
+            .bind(&[did.into(), priv_hex.into(), pub_hex.into(), now.into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .run()
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+    }
+    Ok(Json(serde_json::json!({ "signingKey": signing_did_key })))
 }

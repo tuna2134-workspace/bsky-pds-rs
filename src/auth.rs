@@ -20,6 +20,10 @@ pub struct Caller {
     pub scope: String,
     /// True for OAuth DPoP sessions, false for compat App Password sessions.
     pub oauth: bool,
+    /// True when the session was opened with an App Password.
+    pub app_password: bool,
+    /// App Password privilege flag (meaningful only with `app_password`).
+    pub privileged: bool,
 }
 
 fn now_secs() -> i64 {
@@ -80,7 +84,7 @@ pub async fn authenticate(env: &Env, headers: &HeaderMap, method: &str, path: &s
         if info.jkt != token_jkt {
             return Err(XrpcError::unauthorized("DPoP key mismatch"));
         }
-        return Ok(Caller { did, scope, oauth: true });
+        return Ok(Caller { did, scope, oauth: true, app_password: false, privileged: false });
     }
     if let Some(token) = auth.strip_prefix("Bearer ") {
         let secret = cfg
@@ -92,7 +96,27 @@ pub async fn authenticate(env: &Env, headers: &HeaderMap, method: &str, path: &s
             return Err(XrpcError::unauthorized("refresh token cannot authorize requests"));
         }
         let (did, scope) = check_claims(&payload, &cfg.hostname, "at+jwt")?;
-        return Ok(Caller { did, scope, oauth: false });
+        // Epoch revocation (deleteSession bumps it).
+        let epoch = payload.get("epoch").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+        #[derive(serde::Deserialize)]
+        struct EpochRow {
+            session_epoch: i64,
+        }
+        let row: Option<EpochRow> = db
+            .prepare("SELECT session_epoch FROM account WHERE did = ?1")
+            .bind(&[did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first(None)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        match row {
+            Some(r) if r.session_epoch == epoch => {}
+            _ => return Err(XrpcError::unauthorized("session revoked")),
+        }
+        let app_password = payload.get("appPassword").and_then(|v| v.as_bool()).unwrap_or(false);
+        let privileged = payload.get("privileged").and_then(|v| v.as_bool()).unwrap_or(false);
+        return Ok(Caller { did, scope, oauth: false, app_password, privileged });
     }
     Err(XrpcError::new(StatusCode::UNAUTHORIZED, "AuthenticationRequired", "Unsupported authorization scheme"))
 }
@@ -138,4 +162,18 @@ pub fn check_admin(headers: &HeaderMap, expected: Option<&str>) -> Result<(), Xr
     } else {
         Err(XrpcError::unauthorized("Bad admin credentials"))
     }
+}
+
+/// Reject App Password sessions on account-management endpoints.
+/// Matches the `transition:generic` privilege model: app passwords may read
+/// and write records, but may not manage the account itself (unless created
+/// with the privileged flag by a trusted client).
+pub fn require_full_password(caller: &Caller, endpoint: &str) -> Result<(), XrpcError> {
+    if caller.oauth {
+        return Ok(());
+    }
+    if caller.app_password && !caller.privileged {
+        return Err(XrpcError::forbidden("AuthFailed", format!("{endpoint} requires the account password")));
+    }
+    Ok(())
 }

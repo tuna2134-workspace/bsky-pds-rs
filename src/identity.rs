@@ -586,3 +586,134 @@ mod tests {
         sig.len() == 64 && sig[32..] <= HALF_N[..]
     }
 }
+
+// ---------- PLC updates (rotation / handle / service changes) ----------
+
+#[derive(Debug, Clone, Default)]
+pub struct PlcFields {
+    pub rotation_keys: Vec<String>,
+    pub verification_methods: serde_json::Value,
+    pub also_known_as: Vec<String>,
+    pub services: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlcCurrent {
+    pub fields: PlcFields,
+    pub prev_cid: String,
+}
+
+/// Fetch current PLC state (`/data`) plus the head op CID (`/log/audit`).
+pub async fn plc_current(env: &Env, did: &str) -> Result<PlcCurrent, String> {
+    let cfg = pds_env::PdsEnv::from_env(env).map_err(|e| e.to_string())?;
+    let base = cfg.plc_url.trim_end_matches('/');
+    let (status, text) = fetch_text(&format!("{base}/{did}/data"), "application/json")
+        .await
+        .map_err(|e| e.message.clone())?;
+    if status != 200 {
+        return Err(format!("PLC state fetch failed: {status}"));
+    }
+    let data: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let get_strs = |v: Option<&serde_json::Value>| -> Vec<String> {
+        v.and_then(|x| x.as_array())
+            .map(|a| a.iter().filter_map(|e| e.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default()
+    };
+    let fields = PlcFields {
+        rotation_keys: get_strs(data.get("rotationKeys")),
+        verification_methods: data.get("verificationMethods").cloned().unwrap_or(serde_json::json!({})),
+        also_known_as: get_strs(data.get("alsoKnownAs")),
+        services: data.get("services").cloned().unwrap_or(serde_json::json!({})),
+    };
+    // Audit log -> head CID (accept array-of-entries or single object).
+    let (astatus, atext) = fetch_text(&format!("{base}/{did}/log/audit"), "application/json")
+        .await
+        .map_err(|e| e.message.clone())?;
+    if astatus != 200 {
+        return Err(format!("PLC audit fetch failed: {astatus}"));
+    }
+    let audit: serde_json::Value = serde_json::from_str(&atext).map_err(|e| e.to_string())?;
+    let prev_cid = match &audit {
+        serde_json::Value::Array(entries) => entries
+            .last()
+            .and_then(|e| e.get("cid"))
+            .and_then(|c| c.as_str())
+            .ok_or("audit has no head cid")?
+            .to_string(),
+        serde_json::Value::Object(map) => map
+            .get("cid")
+            .and_then(|c| c.as_str())
+            .ok_or("audit has no cid")?
+            .to_string(),
+        _ => return Err("bad audit shape".into()),
+    };
+    if Cid::parse(&prev_cid).is_err() {
+        return Err("bad prev cid".into());
+    }
+    Ok(PlcCurrent { fields, prev_cid })
+}
+
+use crate::cid::Cid;
+
+#[derive(Debug, Clone, Default)]
+pub struct PlcChanges {
+    pub rotation_keys: Option<Vec<String>>,
+    pub verification_methods: Option<serde_json::Value>,
+    pub also_known_as: Option<Vec<String>>,
+    pub services: Option<serde_json::Value>,
+}
+
+/// Build + low-S sign an update op against the current state.
+pub fn plc_update_op(
+    rotation_priv_hex: &str,
+    current: &PlcCurrent,
+    changes: &PlcChanges,
+) -> Result<serde_json::Value, String> {
+    let rotation_keys = changes.rotation_keys.clone().unwrap_or_else(|| current.fields.rotation_keys.clone());
+    if rotation_keys.is_empty() || rotation_keys.len() > 5 {
+        return Err("rotationKeys must have 1..=5 keys".into());
+    }
+    for k in &rotation_keys {
+        did_key_decode(k).map_err(|e| format!("bad rotationKey: {e}"))?;
+    }
+    let op = serde_json::json!({
+        "type": "plc_operation",
+        "rotationKeys": rotation_keys,
+        "verificationMethods": changes.verification_methods.clone().unwrap_or_else(|| current.fields.verification_methods.clone()),
+        "alsoKnownAs": changes.also_known_as.clone().unwrap_or_else(|| current.fields.also_known_as.clone()),
+        "services": changes.services.clone().unwrap_or_else(|| current.fields.services.clone()),
+        "prev": current.prev_cid,
+    });
+    let bytes = unsigned_op_cbor(&op)?;
+    if bytes.len() > 7500 {
+        return Err("op exceeds 7500 bytes".into());
+    }
+    let digest = keys::sha256_of(&bytes);
+    let sig = low_s_k256(rotation_priv_hex, &digest).map_err(|e| e.to_string())?;
+    let mut signed = op.clone();
+    signed["sig"] = serde_json::Value::String(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig));
+    Ok(signed)
+}
+
+/// Verify an update op's signature against one of the given rotation did:keys.
+pub fn verify_plc_op(op: &serde_json::Value, rotation_keys: &[String]) -> Result<(), String> {
+    let sig_b64 = op.get("sig").and_then(|v| v.as_str()).ok_or("missing sig")?;
+    use base64::Engine as _;
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(sig_b64)
+        .map_err(|_| "bad sig encoding")?;
+    if sig.len() != 64 {
+        return Err("bad sig length".into());
+    }
+    let mut unsigned = op.clone();
+    unsigned.as_object_mut().ok_or("op must be object")?.remove("sig");
+    let bytes = unsigned_op_cbor(&unsigned)?;
+    let digest = keys::sha256_of(&bytes);
+    for rk in rotation_keys {
+        let (_, pub_hex) = did_key_decode(rk).map_err(|e| e.to_string())?;
+        if keys::verify_digest(&pub_hex, &digest, &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    Err("no rotation key verifies this op".into())
+}

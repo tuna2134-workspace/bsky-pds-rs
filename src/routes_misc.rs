@@ -19,7 +19,13 @@ pub fn identity_router(env: Env) -> Router {
     Router::new()
         .route("/xrpc/com.atproto.identity.resolveHandle", get(resolve_handle))
         .route("/xrpc/com.atproto.identity.updateHandle", post(update_handle))
-        .route("/xrpc/com.atproto.identity.getRecommendedDidCredentials", get(not_impl))
+        .route("/xrpc/com.atproto.identity.resolveDid", get(resolve_did))
+        .route("/xrpc/com.atproto.identity.resolveIdentity", get(resolve_identity))
+        .route("/xrpc/com.atproto.identity.refreshIdentity", post(refresh_identity))
+        .route("/xrpc/com.atproto.identity.getRecommendedDidCredentials", get(get_recommended_did_credentials))
+        .route("/xrpc/com.atproto.identity.requestPlcOperationSignature", post(request_plc_operation_signature))
+        .route("/xrpc/com.atproto.identity.signPlcOperation", post(sign_plc_operation))
+        .route("/xrpc/com.atproto.identity.submitPlcOperation", post(submit_plc_operation))
         .route("/.well-known/atproto-did", get(well_known_did))
         .with_state(IdentityState { env })
 }
@@ -940,3 +946,392 @@ async fn issue_session(
         "sub": did,
     }))
 }
+
+// ---------- identity resolution + PLC operations (lexicon-exact) ----------
+
+#[derive(Deserialize)]
+struct DidParam {
+    #[serde(rename = "did")]
+    did: String,
+}
+
+/// resolveDid: raw DID document, no bidirectional handle check.
+#[worker::send]
+async fn resolve_did(State(s): State<IdentityState>, Query(q): Query<DidParam>) -> XrpcResult<Json<serde_json::Value>> {
+    if !atproto::did::validate(&q.did) {
+        return Err(XrpcError::bad_request("InvalidDid", "bad DID"));
+    }
+    let doc = crate::identity::fetch_did_doc(&s.env, &q.did).await?;
+    Ok(Json(serde_json::json!({ "didDoc": doc })))
+}
+
+#[derive(Deserialize)]
+struct IdentifierParam {
+    #[serde(rename = "identifier")]
+    identifier: String,
+}
+
+fn identity_info(did: &str, handle: Option<&str>, doc: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "did": did,
+        "handle": handle.unwrap_or("handle.invalid"),
+        "didDoc": doc,
+    })
+}
+
+/// resolveIdentity: full identity bundle with bidirectionally verified handle
+/// (`handle.invalid` when the check fails).
+#[worker::send]
+async fn resolve_identity(
+    State(s): State<IdentityState>,
+    Query(q): Query<IdentifierParam>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let id = q.identifier.trim();
+    // DID input.
+    if id.starts_with("did:") {
+        if !atproto::did::validate(id) {
+            return Err(XrpcError::bad_request("DidNotFound", "bad DID"));
+        }
+        let doc = crate::identity::fetch_did_doc(&s.env, id).await
+            .map_err(|_| XrpcError::not_found("DidNotFound", "DID not found"))?;
+        let parsed = crate::identity::parse_did_doc(&doc, id)
+            .map_err(|_| XrpcError::not_found("DidNotFound", "bad DID document"))?;
+        let mut verified: Option<String> = None;
+        if let Some(claimed) = parsed.handle {
+            if crate::identity::handle_is_correct(&s.env, id, &claimed).await {
+                verified = Some(claimed);
+            }
+        }
+        return Ok(Json(identity_info(id, verified.as_deref(), &doc)));
+    }
+    // Handle input.
+    if !atproto::handle::validate(id) {
+        return Err(XrpcError::not_found("HandleNotFound", "bad handle"));
+    }
+    // Local accounts first (authoritative, no network needed).
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(Deserialize)]
+    struct LocalRow {
+        did: String,
+    }
+    let local: Option<LocalRow> = db
+        .prepare("SELECT did FROM account WHERE handle = ?1")
+        .bind(&[id.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let did = match local {
+        Some(r) => r.did,
+        None => crate::identity::resolve_handle_to_did(&s.env, id)
+            .await?
+            .ok_or_else(|| XrpcError::not_found("HandleNotFound", "handle does not resolve"))?,
+    };
+    let doc = crate::identity::fetch_did_doc(&s.env, &did).await
+        .map_err(|_| XrpcError::not_found("DidNotFound", "DID not found"))?;
+    let verified = crate::identity::handle_is_correct(&s.env, &did, id).await;
+    Ok(Json(identity_info(&did, verified.then_some(id), &doc)))
+}
+
+#[derive(Deserialize)]
+struct RefreshIdentityReq {
+    identifier: String,
+}
+
+/// refreshIdentity: drop cached resolution, re-resolve, return the bundle.
+#[worker::send]
+async fn refresh_identity(
+    State(s): State<IdentityState>,
+    Json(req): Json<RefreshIdentityReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let id = req.identifier.trim().to_string();
+    // Best-effort cache invalidation (KV keys mirror identity.rs).
+    if let Ok(store) = s.env.kv("CACHE") {
+        if id.starts_with("did:") {
+            let _ = store.delete(&format!("did:doc:{}", crate::keys::sha256_hex(&id))).await;
+        } else {
+            let _ = store.delete(&format!("handle:did:{id}")).await;
+        }
+    }
+    resolve_identity(State(s), Query(IdentifierParam { identifier: id })).await
+}
+
+/// Credentials a migrating account should adopt on THIS service.
+#[worker::send]
+async fn get_recommended_did_credentials(
+    State(s): State<IdentityState>,
+    headers: HeaderMap,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.identity.getRecommendedDidCredentials").await?;
+    let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct KeyRow2 {
+        handle: String,
+        signing_key_k256_pub_hex: Option<String>,
+        rotation_key_k256_priv_hex: Option<String>,
+    }
+    let row: Option<KeyRow2> = db
+        .prepare("SELECT handle, signing_key_k256_pub_hex, rotation_key_k256_priv_hex FROM account WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let Some(acct) = row else {
+        return Err(XrpcError::unauthorized("unknown account"));
+    };
+    // Rotation recommendation: current rotation key if we hold it.
+    let mut rotation_keys = Vec::new();
+    if let Some(priv_hex) = acct.rotation_key_k256_priv_hex {
+        if let Ok(pub_hex) = crate::keys::k256_pub_from_priv(&priv_hex) {
+            if let Ok(dk) = crate::identity::did_key_encode(&pub_hex, &crate::keys::Curve::K256) {
+                rotation_keys.push(dk);
+            }
+        }
+    }
+    let signing_did_key = acct
+        .signing_key_k256_pub_hex
+        .and_then(|h| crate::identity::did_key_encode(&h, &crate::keys::Curve::K256).ok());
+    Ok(Json(serde_json::json!({
+        "rotationKeys": rotation_keys,
+        "alsoKnownAs": [format!("at://{}", acct.handle)],
+        "verificationMethods": signing_did_key.map(|k| serde_json::json!({ "atproto": k })).unwrap_or(serde_json::json!({})),
+        "services": { "atproto_pds": { "type": "AtprotoPersonalDataServer", "endpoint": format!("https://{}", cfg.hostname) } },
+    })))
+}
+
+// --- PLC operation signing (email-code gated, entryway-style) ---
+
+/// Send the email code that authorizes `signPlcOperation`.
+#[worker::send]
+async fn request_plc_operation_signature(
+    State(s): State<IdentityState>,
+    headers: HeaderMap,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.identity.requestPlcOperationSignature").await?;
+    if !caller.did.starts_with("did:plc:") {
+        return Err(XrpcError::bad_request("InvalidDid", "PLC operations need a did:plc"));
+    }
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct ERow3 {
+        email: Option<String>,
+    }
+    let row: Option<ERow3> = db
+        .prepare("SELECT email FROM account WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let email = row.and_then(|r| r.email).unwrap_or_default();
+    if email.is_empty() {
+        return Err(XrpcError::bad_request("InvalidEmail", "no email on file"));
+    }
+    let token = issue_plc_token(&s.env, &caller.did).await?;
+    let text = format!("Authorize your identity update with this code:\n\n{token}\n\nIt expires in 1 hour.\n");
+    crate::email::send_email(&s.env, &email, "Authorize your identity update", &text).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+async fn issue_plc_token(env: &worker::Env, did: &str) -> XrpcResult<String> {
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let token = crate::keys::random_b64u32().map_err(|e| XrpcError::internal(e.to_string()))?;
+    let now = pds_env::now_iso();
+    let exp_ms = worker::Date::now().as_millis() as i64 + 3600 * 1000;
+    let exp = format!("{:013}", exp_ms);
+    // Reuse email_token with a sortable millis expiry (compared as text).
+    // NOTE: other purposes store ISO; plc rows are distinguished by purpose.
+    let _ = now;
+    db.prepare("INSERT INTO email_token (did, purpose, token_hash, email, expires_at, used_at, created_at) VALUES (?1, 'plc', ?2, '', ?3, NULL, ?4)")
+        .bind(&[did.into(), crate::keys::sha256_hex(&token).into(), exp.into(), pds_env::now_iso().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(token)
+}
+
+async fn consume_plc_token(env: &worker::Env, did: &str, token: &str) -> XrpcResult<()> {
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct PlcTokRow {
+        did: String,
+        expires_at: String,
+    }
+    let row: Option<PlcTokRow> = db
+        .prepare("SELECT did, expires_at FROM email_token WHERE purpose = 'plc' AND token_hash = ?1 AND used_at IS NULL")
+        .bind(&[crate::keys::sha256_hex(token).into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let Some(r) = row else {
+        return Err(XrpcError::bad_request("InvalidToken", "bad token"));
+    };
+    if r.did != did {
+        return Err(XrpcError::bad_request("InvalidToken", "token mismatch"));
+    }
+    let now_ms = format!("{:013}", worker::Date::now().as_millis() as i64);
+    if r.expires_at <= now_ms {
+        return Err(XrpcError::bad_request("InvalidToken", "token expired"));
+    }
+    db.prepare("UPDATE email_token SET used_at = ?1 WHERE purpose = 'plc' AND token_hash = ?2")
+        .bind(&[pds_env::now_iso().into(), crate::keys::sha256_hex(token).into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct SignPlcOperationReq {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default, rename = "rotationKeys")]
+    rotation_keys: Option<Vec<String>>,
+    #[serde(default, rename = "alsoKnownAs")]
+    also_known_as: Option<Vec<String>>,
+    #[serde(default, rename = "verificationMethods")]
+    verification_methods: Option<serde_json::Value>,
+    #[serde(default)]
+    services: Option<serde_json::Value>,
+}
+
+/// Sign a PLC update for the caller's DID (email-code gated). Returns the
+/// signed operation; submit it via `submitPlcOperation` (or elsewhere).
+#[worker::send]
+async fn sign_plc_operation(
+    State(s): State<IdentityState>,
+    headers: HeaderMap,
+    Json(req): Json<SignPlcOperationReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.identity.signPlcOperation").await?;
+    if !caller.did.starts_with("did:plc:") || caller.did.starts_with("did:plc:dev") {
+        return Err(XrpcError::bad_request("InvalidDid", "PLC operations need a registered did:plc"));
+    }
+    let token = req.token.as_deref().ok_or_else(|| XrpcError::bad_request("InvalidToken", "email token required"))?;
+    consume_plc_token(&s.env, &caller.did, token).await?;
+    if req.rotation_keys.is_none()
+        && req.also_known_as.is_none()
+        && req.verification_methods.is_none()
+        && req.services.is_none()
+    {
+        return Err(XrpcError::bad_request("InvalidRequest", "nothing to update"));
+    }
+    let current = crate::identity::plc_current(&s.env, &caller.did)
+        .await
+        .map_err(|e| XrpcError::new(axum::http::StatusCode::BAD_GATEWAY, "PlcError", e.to_string()))?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct RotRow {
+        rotation_key_k256_priv_hex: Option<String>,
+    }
+    let row: Option<RotRow> = db
+        .prepare("SELECT rotation_key_k256_priv_hex FROM account WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let rot_priv = row.and_then(|r| r.rotation_key_k256_priv_hex).unwrap_or_default();
+    if rot_priv.is_empty() {
+        return Err(XrpcError::bad_request("InvalidRequest", "no rotation key held; rotate externally"));
+    }
+    let op = crate::identity::plc_update_op(
+        &rot_priv,
+        &current,
+        &crate::identity::PlcChanges {
+            rotation_keys: req.rotation_keys,
+            verification_methods: req.verification_methods,
+            also_known_as: req.also_known_as,
+            services: req.services,
+        },
+    )
+    .map_err(XrpcError::internal)?;
+    Ok(Json(serde_json::json!({ "operation": op })))
+}
+
+#[derive(serde::Deserialize)]
+struct SubmitPlcOperationReq {
+    operation: serde_json::Value,
+}
+
+/// Validate a PLC op against service constraints, then submit it to the
+/// directory. Migration-away (PDS endpoint leaves us) deactivates the local
+/// account; handle changes update it — both with firehose events.
+#[worker::send]
+async fn submit_plc_operation(
+    State(s): State<IdentityState>,
+    headers: HeaderMap,
+    Json(req): Json<SubmitPlcOperationReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.identity.submitPlcOperation").await?;
+    let op = &req.operation;
+    if op.get("type").and_then(|v| v.as_str()) != Some("plc_operation") {
+        return Err(XrpcError::bad_request("InvalidRequest", "only plc_operation supported here"));
+    }
+    if op.get("prev").is_none() {
+        return Err(XrpcError::bad_request("InvalidRequest", "update ops need prev"));
+    }
+    // Constraint: alsoKnownAs handles must be valid; services keep shape.
+    if let Some(aka) = op.get("alsoKnownAs").and_then(|v| v.as_array()) {
+        for h in aka {
+            let uri = h.as_str().unwrap_or("");
+            let handle = uri.strip_prefix("at://").unwrap_or("");
+            if !atproto::handle::validate(handle) {
+                return Err(XrpcError::bad_request("InvalidRequest", "bad handle in alsoKnownAs"));
+            }
+        }
+    }
+    // Must be signed by one of the CURRENT rotation keys (anti-takeover).
+    let current = crate::identity::plc_current(&s.env, &caller.did)
+        .await
+        .map_err(|e| XrpcError::new(axum::http::StatusCode::BAD_GATEWAY, "PlcError", e.to_string()))?;
+    crate::identity::verify_plc_op(op, &current.fields.rotation_keys)
+        .map_err(|e| XrpcError::bad_request("InvalidRequest", e))?;
+    crate::identity::plc_submit(&s.env, &caller.did, op).await?;
+    // Directory state changed: drop cached resolution so reads go fresh.
+    if let Ok(store) = s.env.kv("CACHE") {
+        let _ = store.delete(&format!("did:doc:{}", crate::keys::sha256_hex(&caller.did))).await;
+    }
+    // Post-submit local reconciliation.
+    let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let our_endpoint = format!("https://{}", cfg.hostname);
+    let new_endpoint = op
+        .get("services")
+        .and_then(|v| v.get("atproto_pds"))
+        .and_then(|v| v.get("endpoint"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    if !new_endpoint.is_empty() && new_endpoint != our_endpoint {
+        // Migrated away: deactivate locally so relays stop pulling from us.
+        let now = pds_env::now_iso();
+        db.prepare("UPDATE account SET active = 0, status = 'deactivated', updated_at = ?1 WHERE did = ?2")
+            .bind(&[now.into(), caller.did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .run()
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        crate::firehose::emit_account(&s.env, &caller.did, false, Some("deactivated")).await?;
+    }
+    if let Some(first) = op.get("alsoKnownAs").and_then(|v| v.as_array()).and_then(|a| a.first()).and_then(|h| h.as_str()) {
+        if let Some(handle) = first.strip_prefix("at://") {
+            if atproto::handle::validate(handle) {
+                let now = pds_env::now_iso();
+                db.prepare("UPDATE account SET handle = ?1, updated_at = ?2 WHERE did = ?3")
+                    .bind(&[handle.into(), now.into(), caller.did.clone().into()])
+                    .map_err(|e| XrpcError::internal(e.to_string()))?
+                    .run()
+                    .await
+                    .map_err(|e| XrpcError::internal(e.to_string()))?;
+                crate::firehose::emit_identity(&s.env, &caller.did, Some(handle)).await?;
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({})))
+}
+

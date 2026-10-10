@@ -17,10 +17,10 @@
 | requestEmailConfirmation / confirmEmail / updateEmail | ✅ | 24h トークン・単発・SMTP/log 配送 |
 | deleteAccount | ✅ | パスワード要求・全消去・`#account deleted` |
 | listReposByCollection | ✅ | コレクション逆引き (DID カーソル) |
-| checkAccountStatus | 🚧 | |
+| checkAccountStatus | ✅ | repo/ブロブ実測 | |
 | activateAccount / deactivateAccount | ✅ | 自アカウントの停止・再開。`#account` 発火・非 active は書き込み不可 |
-| confirmEmail / requestEmailConfirmation / requestEmailUpdate / updateEmail | ⬜ | SMTP と同時実装 |
-| getServiceAuth / refreshAppPassword 相当 | ⬜ | service JWT 発行として実装予定 |
+| confirmEmail / requestEmailConfirmation | ✅ | 24h 単発トークン・SMTP/log 配送 |
+| getServiceAuth | ✅ | ES256K サービス JWT (aud/lxm/exp 上限1h) |
 
 ## repo (`com.atproto.repo.*`)
 
@@ -30,7 +30,7 @@
 | createRecord / getRecord / putRecord / deleteRecord / listRecords | ✅ | 実 DAG-CBOR CID・署名 commit・`rev` 採番・firehose CAR slice。`swapCommit`/`swapRecord` 対応 |
 | applyWrites | ✅ (create のみ完全) | update/delete は結果形のみ、次段で完全化 |
 | uploadBlob | ✅ | R2 実体 + D1 インデックス。参照 CID は raw sha2-256 (`bafkrei…`) |
-| listMissingBlobs / importRepo | ⬜ | 移行フローと同時実装 |
+| listMissingBlobs | ⬜ | checkAccountStatus で代替計数。CAR 自動 import は未着手 |
 
 ## sync (`com.atproto.sync.*`)
 
@@ -38,7 +38,7 @@
 |---|---|---|
 | getRepoStatus / listRepos / getLatestCommit | ✅ | 実 commit CID・rev |
 | getRepo / getRecord / getBlocks | ✅ | バイナリ CAR (`application/vnd.ipld.car`)。ハッシュ検証付き parse |
-| getBlocks | 🚧 | binary CAR 化待ち |
+| getBlocks | ✅ | バイナリ CAR サブセット |
 | listBlobs / getBlob | ✅ | R2 実体 (blob_router) |
 | subscribeRepos | ✅ | WebSocket (event-stream v0: header+payload CBOR 連結)。`cursor` 再開・`FutureCursor`・ポーリング JSON 互換も維持 |
 | requestCrawl | ✅ | 自ホスト名の announce を crawlers へ best-effort 転送。作成時にも自動通知 |
@@ -52,15 +52,15 @@
 | atproto-proxy 転送 | ✅ | 未定義 `/xrpc/*` + ヘッダで他サービスへ転送。ES256K サービス JWT・SSRF ガード |
 | PLC 登録 | ✅ | 公開 handle は genesis+submit で実 `did:plc`。loopback は dev DID |
 | updateHandle | ✅ | 要認証 |
-| getRecommendedDidCredentials | 🚧 | PLC 鍵連携と同時実装 |
-| signPlcOperation / submitPlcOperation / requestPlcOperationSignature | ⬜ | PLC 連携 (ROADMAP §4) |
+| getRecommendedDidCredentials | ✅ | 移行先推奨資格情報 | PLC 鍵連携と同時実装 |
+| signPlcOperation / submitPlcOperation / requestPlcOperationSignature | ✅ | メール符号・更新op署名・検証付き提出・移行時自動処理 | PLC 連携 (ROADMAP §4) |
 
 ## admin (`com.atproto.admin.*`)
 
 | NSID | 状態 | 備考 |
 |---|---|---|
 | getAccountInfo | ✅ | 管理者トークン必須 |
-| その他 (updateAccount*/deleteAccount/takedown 類) | ⬜ | 監査ログと同時実装 |
+| updateAccountPassword 等の残 admin API | ⬜ | 監査ログ・takedown 伝播と同時実装 |
 
 ## OAuth (`/.well-known/*`, `/oauth/*`, `/jwks.json`)
 
@@ -81,5 +81,5 @@
 | `GET /.well-known/atproto-did` | ✅ | handle→DID テキスト |
 | XRPC エラー標準 | ✅ | `{"error","message"}` + 仕様ステータス |
 | CORS | ✅ (暫定) | `*` 許可。厳密化は本番設定で |
-| `Atproto-Repo-Rev` ヘッダ | ⬜ | ROADMAP §2 |
-| service proxying (`atproto-proxy`) | ⬜ | ヘッダパースのみ実装済み |
+| `Atproto-Repo-Rev` ヘッダ | ✅ | 全 repo 書き込みに付与 |
+| service proxying (`atproto-proxy`) | ✅ | 転送+ES256K JWT・SSRF ガード |
