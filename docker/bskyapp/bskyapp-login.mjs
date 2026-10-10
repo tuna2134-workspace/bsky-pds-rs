@@ -331,22 +331,82 @@ try {
       note('handle login via official client', ok2, t2.slice(0, 160).replace(/\n/g, ' '));
     }
     if (ok2) {
-      const sess = await fetch(`${PDS}/xrpc/com.atproto.server.createSession`, {
+      // ---- 6. post from the composer; verify the record lands in OUR repo ----
+      const POST_TEXT = `hello from bsky.app via rust pds ${Date.now()}`;
+      await page2.goto('https://bsky.app/', { waitUntil: 'networkidle2', timeout: 60000 });
+      await new Promise((r) => setTimeout(r, 4000));
+      const composerOpened = await page2.evaluate(() => {
+        const byAria = [...document.querySelectorAll('button,a')].find((e) =>
+          /compose|new post|create post/i.test(e.getAttribute('aria-label') ?? ''));
+        if (byAria) { byAria.click(); return true; }
+        const els = [...document.querySelectorAll('button,a,div[role="button"],div[role="textbox"],textarea')];
+        const c = els.find((e) => /what's up/i.test(e.textContent ?? e.getAttribute?.('placeholder') ?? ''));
+        if (c) { c.click(); return true; }
+        return false;
+      });
+      note('composer opened', composerOpened);
+      await new Promise((r) => setTimeout(r, 3000));
+      await page2.screenshot({ path: `${OUT}/09-composer.png` });
+      const typed = await page2.evaluate((text) => {
+        const box = document.querySelector('div[contenteditable="true"],div[role="textbox"],textarea');
+        if (!box) return false;
+        box.focus();
+        return true;
+      }, POST_TEXT);
+      if (typed) {
+        await page2.keyboard.type(POST_TEXT, { delay: 20 });
+      }
+      note('composer typed', typed);
+      await new Promise((r) => setTimeout(r, 1500));
+      await page2.screenshot({ path: `${OUT}/10-composed.png` });
+      const posted = await page2.evaluate(() => {
+        const els = [...document.querySelectorAll('button,div[role="button"]')];
+        const b = els.find((e) => /^post$/i.test((e.textContent ?? '').trim()) && e.offsetParent !== null);
+        if (b) { b.click(); return true; }
+        return false;
+      });
+      note('post submitted', posted);
+      await new Promise((r) => setTimeout(r, 8000));
+      await page2.screenshot({ path: `${OUT}/11-posted.png` });
+      // Verify against OUR repo directly (AppView indexing not required).
+      const sess2 = await fetch(`${PDS}/xrpc/com.atproto.server.createSession`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ identifier: DID, password: PASSWORD }),
       }).then((r) => r.json());
-      const recs = await fetch(
-        `${PDS}/xrpc/com.atproto.repo.listRecords?repo=${DID}&collection=app.bsky.feed.post&limit=5`,
-        { headers: { Authorization: `Bearer ${sess.accessJwt}` } },
+      const feed = await fetch(
+        `${PDS}/xrpc/com.atproto.repo.listRecords?repo=${DID}&collection=app.bsky.feed.post&limit=10`,
+        { headers: { Authorization: `Bearer ${sess2.accessJwt}` } },
       ).then((r) => r.json());
-      const rkey = (recs.records?.[0]?.uri ?? '').split('/').pop();
-      if (rkey) {
+      const mine = (feed.records ?? []).find((r) => r.value?.text === POST_TEXT);
+      note('composer post in our repo', !!mine, mine?.uri ?? 'not found');
+
+      // ---- 7. DM attempt (chat service via proxy; outcome recorded) ----
+      const chatOpened = await page2.evaluate(() => {
+        const byAria = [...document.querySelectorAll('button,a')].find((e) =>
+          /^(chat|messages)$/i.test(e.getAttribute('aria-label') ?? ''));
+        if (byAria) { byAria.click(); return true; }
+        const byHref = [...document.querySelectorAll('a')].find((e) =>
+          /messages|chat/.test(e.getAttribute('href') ?? ''));
+        if (byHref) { byHref.click(); return true; }
+        const els = [...document.querySelectorAll('button,a,div[role="button"],div[role="link"]')];
+        const c = els.find((e) => /^(chat|messages)$/i.test((e.textContent ?? '').trim()));
+        if (c) { c.click(); return true; }
+        return false;
+      });
+      note('chat opened', chatOpened);
+      await new Promise((r) => setTimeout(r, 6000));
+      await page2.screenshot({ path: `${OUT}/12-chat.png` });
+      const chatText = await page2.evaluate(() => document.body.innerText.slice(0, 300));
+      note('chat outcome (informational)', true, chatText.slice(0, 160).replace(/\n/g, ' '));
+
+      // Post page visit (needs relay indexing; informational only).
+      if (mine?.uri) {
+        const rkey = mine.uri.split('/').pop();
         await page2.goto(`https://bsky.app/profile/${DID}/post/${rkey}`, { waitUntil: 'networkidle2', timeout: 60000 });
         await new Promise((r) => setTimeout(r, 6000));
         await page2.screenshot({ path: `${OUT}/07-own-post.png` });
         const pt = await page2.evaluate(() => document.body.innerText.slice(0, 500));
-        // Post pages need relay indexing (out of PDS scope); informational only.
         note('own post renders (informational)', true, pt.slice(0, 120).replace(/\n/g, ' '));
       }
     }

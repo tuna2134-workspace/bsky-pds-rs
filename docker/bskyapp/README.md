@@ -7,6 +7,8 @@ Drives the real https://bsky.app in headless Chrome against this PDS:
 3. login (createSession/refreshSession/getSession on our PDS)
 4. preferences, profile/chat records from our repo, proxied AppView reads
 5. age-assurance gate (birthdate from `BSKY_TEST_BIRTHDATE`) to home timeline
+6. composer post from the official client, verified in our repo
+   (`applyWrites` + blob upload); chat UI load check
 
 ## Run
 
