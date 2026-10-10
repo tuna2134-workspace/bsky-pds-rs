@@ -26,6 +26,7 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.sync.subscribeRepos", get(subscribe_repos))
         .route("/xrpc/com.atproto.sync.requestCrawl", post(request_crawl))
         .route("/xrpc/com.atproto.sync.getLatestCommit", get(get_latest_commit))
+        .route("/xrpc/com.atproto.sync.listReposByCollection", get(list_repos_by_collection))
         .with_state(SyncState { env })
 }
 
@@ -312,4 +313,59 @@ pub async fn notify_crawlers(_env: &worker::Env, cfg: &pds_env::PdsEnv) -> Vec<S
         }
     }
     ok
+}
+
+// ---------- listReposByCollection ----------
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct ByCollectionParam {
+    #[serde(rename = "collection")]
+    collection: String,
+    #[serde(rename = "limit")]
+    limit: Option<i64>,
+    #[serde(rename = "cursor")]
+    cursor: Option<String>,
+}
+
+/// DIDs holding at least one record in `collection` (record-level resync
+/// bootstrap). Cursor is a DID offset; empty cursor omits.
+#[worker::send]
+async fn list_repos_by_collection(
+    State(s): State<SyncState>,
+    Query(q): Query<ByCollectionParam>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    if !crate::atproto::nsid::validate(&q.collection) {
+        return Err(XrpcError::bad_request("InvalidNsid", "bad collection"));
+    }
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let rows = if let Some(cur) = q.cursor.clone() {
+        db.prepare("SELECT DISTINCT did AS d FROM record WHERE collection = ?1 AND did > ?2 ORDER BY did ASC LIMIT ?3")
+            .bind(&[q.collection.clone().into(), cur.into(), (limit as f64).into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .all().await.map_err(|e| XrpcError::internal(e.to_string()))?
+    } else {
+        db.prepare("SELECT DISTINCT did AS d FROM record WHERE collection = ?1 ORDER BY did ASC LIMIT ?2")
+            .bind(&[q.collection.clone().into(), (limit as f64).into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .all().await.map_err(|e| XrpcError::internal(e.to_string()))?
+    };
+    #[derive(serde::Deserialize)]
+    struct DidLite {
+        d: String,
+    }
+    let mut repos = Vec::new();
+    let mut last: Option<String> = None;
+    for r in rows.results::<DidLite>().unwrap_or_default() {
+        repos.push(serde_json::json!({ "did": r.d }));
+        last = Some(r.d);
+    }
+    let mut out = serde_json::json!({ "repos": repos });
+    if repos.len() as i64 == limit {
+        if let Some(c) = last {
+            out["cursor"] = serde_json::Value::String(c);
+        }
+    }
+    Ok(Json(out))
 }

@@ -7,6 +7,7 @@ pub mod atproto;
 pub mod auth;
 pub mod car;
 pub mod cbor;
+pub mod email;
 pub mod cid;
 pub mod firehose;
 pub mod firehose_ws;

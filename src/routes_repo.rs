@@ -198,6 +198,11 @@ struct ExistsRow {
     cid: String,
 }
 
+#[derive(Deserialize)]
+struct PrevRow {
+    cid: String,
+}
+
 // --- getRecord ---
 
 #[derive(Deserialize)]
@@ -272,6 +277,11 @@ async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): J
     let (canonical, cid, bytes) = repo::canonical_record_cid(&req.record)?;
     let now = pds_env::now_iso();
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let prev_cid: Option<String> = db.prepare("SELECT cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+        .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first::<PrevRow>(None).await.map_err(|e| XrpcError::internal(e.to_string()))?
+        .map(|r| r.cid);
     if let Some(expected) = req.swap_record.as_deref() {
         let cur: Option<ExistsRow> = db.prepare("SELECT cid AS cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
             .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
@@ -286,8 +296,11 @@ async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): J
         .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into(), cid.to_string().into(), canonical.into(), now.into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    let ops = vec![serde_json::json!({"action":"update","path":format!("{}/{}", req.collection, req.rkey),"cid":{ "$link": cid.to_string() }})];
-    let out = repo::commit_repo(&s.env, &req.repo, ops, vec![(cid.clone(), bytes)], req.swap_commit.as_deref()).await?;
+    let mut update_op = serde_json::json!({"action":"update","path":format!("{}/{}", req.collection, req.rkey),"cid":{ "$link": cid.to_string() }});
+    if let Some(prev) = prev_cid.as_deref() {
+        update_op["prev"] = serde_json::json!({ "$link": prev });
+    }
+    let out = repo::commit_repo(&s.env, &req.repo, vec![update_op], vec![(cid.clone(), bytes)], req.swap_commit.as_deref()).await?;
     db.prepare("UPDATE record SET rev = ?1 WHERE did = ?2 AND collection = ?3 AND rkey = ?4")
         .bind(&[out.rev.clone().into(), req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
@@ -334,12 +347,20 @@ async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
             _ => return Err(XrpcError::bad_request("InvalidSwap", "swapRecord does not match")),
         }
     }
+    let prev_cid: Option<String> = db.prepare("SELECT cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+        .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first::<PrevRow>(None).await.map_err(|e| XrpcError::internal(e.to_string()))?
+        .map(|r| r.cid);
     db.prepare("DELETE FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
         .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    let ops = vec![serde_json::json!({"action":"delete","path":format!("{}/{}", req.collection, req.rkey)})];
-    let out = repo::commit_repo(&s.env, &req.repo, ops, vec![], req.swap_commit.as_deref()).await?;
+    let mut delete_op = serde_json::json!({"action":"delete","path":format!("{}/{}", req.collection, req.rkey)});
+    if let Some(prev) = prev_cid.as_deref() {
+        delete_op["prev"] = serde_json::json!({ "$link": prev });
+    }
+    let out = repo::commit_repo(&s.env, &req.repo, vec![delete_op], vec![], req.swap_commit.as_deref()).await?;
     Ok(with_rev(
         &out.rev,
         serde_json::json!({"commit": {"cid": out.commit.to_string(), "rev": out.rev}}),
@@ -465,22 +486,40 @@ async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req):
                 let rkey = w.get("rkey").and_then(|v| v.as_str()).unwrap_or("");
                 let value = w.get("value").cloned().unwrap_or(serde_json::json!({}));
                 let (canonical, cid, bytes) = repo::canonical_record_cid(&value)?;
+                let prev_cid: Option<String> = db.prepare("SELECT cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+                    .bind(&[req.repo.clone().into(), collection.into(), rkey.into()])
+                    .map_err(|e| XrpcError::internal(e.to_string()))?
+                    .first::<PrevRow>(None).await.map_err(|e| XrpcError::internal(e.to_string()))?
+                    .map(|r| r.cid);
                 db.prepare("INSERT INTO record (did, collection, rkey, cid, value_json, rev, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?6) ON CONFLICT(did, collection, rkey) DO UPDATE SET cid = excluded.cid, value_json = excluded.value_json, updated_at = excluded.updated_at")
                     .bind(&[req.repo.clone().into(), collection.into(), rkey.into(), cid.to_string().into(), canonical.into(), now.clone().into()])
                     .map_err(|e| XrpcError::internal(e.to_string()))?
                     .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-                ops.push(serde_json::json!({"action":"update","path":format!("{collection}/{rkey}"),"cid":{ "$link": cid.to_string() }}));
+                let mut update_op = serde_json::json!({"action":"update","path":format!("{collection}/{rkey}"),"cid":{ "$link": cid.to_string() }});
+                if let Some(prev) = prev_cid.as_deref() {
+                    update_op["prev"] = serde_json::json!({ "$link": prev });
+                }
+                ops.push(update_op);
                 changed.push((cid.clone(), bytes));
                 results.push(serde_json::json!({"$type":"com.atproto.repo.applyWrites#updateResult","uri":format!("at://{}/{}/{rkey}", req.repo, collection),"cid":cid.to_string()}));
             }
             "com.atproto.repo.applyWrites#delete" => {
                 let collection = w.get("collection").and_then(|v| v.as_str()).unwrap_or("");
                 let rkey = w.get("rkey").and_then(|v| v.as_str()).unwrap_or("");
+                let prev_cid: Option<String> = db.prepare("SELECT cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+                    .bind(&[req.repo.clone().into(), collection.into(), rkey.into()])
+                    .map_err(|e| XrpcError::internal(e.to_string()))?
+                    .first::<PrevRow>(None).await.map_err(|e| XrpcError::internal(e.to_string()))?
+                    .map(|r| r.cid);
                 db.prepare("DELETE FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
                     .bind(&[req.repo.clone().into(), collection.into(), rkey.into()])
                     .map_err(|e| XrpcError::internal(e.to_string()))?
                     .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-                ops.push(serde_json::json!({"action":"delete","path":format!("{collection}/{rkey}")}));
+                let mut delete_op = serde_json::json!({"action":"delete","path":format!("{collection}/{rkey}")});
+                if let Some(prev) = prev_cid.as_deref() {
+                    delete_op["prev"] = serde_json::json!({ "$link": prev });
+                }
+                ops.push(delete_op);
                 results.push(serde_json::json!({"$type":"com.atproto.repo.applyWrites#deleteResult"}));
             }
             _ => return Err(XrpcError::bad_request("InvalidWrite", format!("unsupported write $type: {t}"))),

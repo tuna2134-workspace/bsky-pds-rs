@@ -24,7 +24,7 @@
 - [x] MST 実装: 決定論リビルド (挿入順不変)・depth 検証・ノード parse (参照 TS 実装と同形。言語間ルートベクタ一致済み)
 - [x] 署名付き commit (`sig` over unsigned-commit sha256, k256 決定論署名; p256 検証対応) とアカウント作成時鍵生成 + DID Multikey 公開 + 旧行の鍵バックフィル
 - [x] CAR v1 バイナリ export (`getRepo/getBlocks`) と record 1MB 上限制御 (`MAX_RECORD_BYTES`)
-- [ ] diff (CAR slice) + operation-inversion 検証 (test vectors: atproto-interop-tests) — commit イベントは commit+全 MST ノード+変更レコードの slice を搬送 (検証可能)、厳密な最小 diff は次段
+- [x] commit slice の operation-inversion 検証器 (`mst::verify_commit_slice`: rewind→rebuild→`prevData` 照合)。`prev` 付与を全 update/delete に徹底。 tamper ケースの単体テスト付き
 - [x] `pseudo_cid_for_json` / `mst:{rev}` プレースホルダの置換 (旧 `dev…` 行は自己修復で実 CID 化)
 - [ ] MST ノードあたりエントリ上限・CAR streamable 順序・鍵ローテーション時 re-commit
 
@@ -64,8 +64,13 @@
 
 ## 5. AppView/Relay 連携・運用
 
+- [x] メール送信基盤 (`src/email.rs`: SMTP submit・STARTTLS・AUTH LOGIN/PLAIN・log モード)。確認/更新/リセットのトークン論理 + エンドポイント群
+- [x] `listReposByCollection` (resync bootstrap 用コレクション逆引き)
+- [x] `deleteAccount` (パスワード要求・R2 含む全消去・`#account deleted`)
+
+
 - [x] service proxying (`atproto-proxy` 転送 + inter-service JWT `lxm/aud` ES256K・SSRF ガード)。スタブ AppView 相手に中継+署名検証の E2E 済み (`scripts/e2e_proxy.py`)
-- [ ] メール (SMTP) 検証・パスワードリセット・`checkAccountStatus`
+- [ ] `checkAccountStatus` 本実装・SMTP 送信タイムアウト・レート制限・メトリクス
 - [ ] `com.atproto.admin.*` 拡充・監査ログ
 - [ ] レート制限・サイズ制限の本番値・OpenTelemetry メトリクス
 - [ ] バックアップ/リストア (repo CAR + D1 ダンプ)・Bsky app 接続 E2E

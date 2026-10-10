@@ -12,6 +12,7 @@ pub struct PdsEnv {
     pub invite_required: bool,
     pub blob_upload_limit: usize,
     pub crawlers: String,
+    pub email_from: Option<String>,
 }
 
 impl PdsEnv {
@@ -26,6 +27,7 @@ impl PdsEnv {
             invite_required: env.var("PDS_INVITE_REQUIRED").map(|v| v.to_string()).unwrap_or_else(|_| "true".into()) == "true",
             blob_upload_limit: env.var("PDS_BLOB_UPLOAD_LIMIT").map(|v| v.to_string()).ok().and_then(|s| s.parse().ok()).unwrap_or(52_428_800),
             crawlers: env.var("PDS_CRAWLERS").map(|v| v.to_string()).unwrap_or_else(|_| "https://bsky.network".into()),
+            email_from: env.var("PDS_EMAIL_FROM_ADDRESS").map(|v| v.to_string()).ok(),
         })
     }
 }

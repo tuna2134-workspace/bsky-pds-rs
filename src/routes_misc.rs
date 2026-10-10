@@ -313,7 +313,7 @@ pub fn oauth_router(env: Env) -> Router {
 async fn protected_resource(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(),
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(), email_from: None,
     });
     Json(serde_json::json!({
         "resource": format!("https://{}", cfg.hostname),
@@ -327,7 +327,7 @@ async fn protected_resource(State(s): State<OAuthState>) -> Json<serde_json::Val
 async fn auth_server_meta(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(),
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(), email_from: None,
     });
     let iss = format!("https://{}", cfg.hostname);
     Json(serde_json::json!({
@@ -349,7 +349,7 @@ async fn auth_server_meta(State(s): State<OAuthState>) -> Json<serde_json::Value
 async fn did_json(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(),
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800, crawlers: "https://bsky.network".into(), email_from: None,
     });
     let origin = format!("https://{}", cfg.hostname);
     Json(serde_json::json!({

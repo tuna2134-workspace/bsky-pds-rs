@@ -146,6 +146,7 @@ name = "bsky-pds-rs"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "axum",
  "base32",
  "base64",
@@ -159,6 +160,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
  "tower-service",
  "uuid",
  "worker",
@@ -1039,6 +1041,7 @@ version = "1.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
 dependencies = [
+ "bytes",
  "pin-project-lite",
 ]
 

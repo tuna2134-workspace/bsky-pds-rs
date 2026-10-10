@@ -27,6 +27,12 @@ META_URL = f"http://127.0.0.1:{META_PORT}/oauth-client-metadata.json"
 REDIRECT = f"http://127.0.0.1:{META_PORT}/callback"
 ADMIN = base64.b64encode(b"admin:change-me-admin").decode()
 
+CONF_JWK = None  # filled after keygen below
+# Unique per run: server caches metadata by client_id (1h TTL).
+RUN_TAG = base64.urlsafe_b64encode(__import__("os").urandom(6)).decode().rstrip("=")
+CONF_META_URL = f"http://127.0.0.1:{META_PORT}/oauth-client-metadata-conf.json?run={RUN_TAG}"
+CONF_REDIRECT = f"http://127.0.0.1:{META_PORT}/callback2"
+
 META_DOC = {
     "client_id": META_URL,
     "application_type": "web",
@@ -39,10 +45,19 @@ META_DOC = {
 }
 
 
+CONF_DOC = {}
+
 class MetaHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/oauth-client-metadata.json":
             body = json.dumps(META_DOC).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/oauth-client-metadata-conf.json"):
+            body = json.dumps(CONF_DOC).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -302,6 +317,70 @@ def main():
     # old refresh must now be rejected (rotated)
     st, body = refresh_with(refresh)
     check("old refresh rejected", st == 400 and body.get("error") == "invalid_grant", f"{st} {body}")
+
+    # ---- confidential client (private_key_jwt) ----
+    conf_priv = int.from_bytes(os.urandom(32), "big") % N
+    conf_Q = pt_mul(conf_priv, G)
+    conf_jwk = {"kty": "EC", "crv": "P-256", "kid": "conf1",
+                "x": b64u(conf_Q[0].to_bytes(32, "big")),
+                "y": b64u(conf_Q[1].to_bytes(32, "big"))}
+    CONF_DOC.update({
+        "client_id": CONF_META_URL.split("?")[0] + "?run=" + RUN_TAG,
+        "application_type": "web",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "scope": "atproto transition:generic",
+        "response_types": ["code"],
+        "redirect_uris": [CONF_REDIRECT],
+        "token_endpoint_auth_method": "private_key_jwt",
+        "token_endpoint_auth_signing_alg": "ES256",
+        "jwks": {"keys": [conf_jwk]},
+        "dpop_bound_access_tokens": True,
+    })
+
+    def client_assertion(aud):
+        h = b64u(json.dumps({"alg": "ES256", "kid": "conf1", "typ": "jwt"},
+                            separators=(",", ":")).encode())
+        claims = {"iss": CONF_META_URL, "sub": CONF_META_URL, "aud": aud,
+                  "jti": b64u(os.urandom(16)),
+                  "exp": __import__("time").time().__int__() + 300}
+        p = b64u(json.dumps(claims, separators=(",", ":")).encode())
+        sig = es256_sign(hashlib.sha256(f"{h}.{p}".encode()).digest(), key=conf_priv)
+        return f"{h}.{p}.{b64u(sig)}"
+
+    verifier2 = b64u(os.urandom(32))
+    challenge2 = b64u(hashlib.sha256(verifier2.encode()).digest())
+    par_url = BASE + "/oauth/par"
+    st, _, par2 = form("/oauth/par", {
+        "client_id": CONF_META_URL, "redirect_uri": CONF_REDIRECT,
+        "scope": "atproto", "state": "conf-state",
+        "code_challenge": challenge2, "code_challenge_method": "S256",
+        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        "client_assertion": client_assertion(par_url)})
+    check("confidential PAR", st == 200, str(par2)[:100])
+    if st == 200:
+        st, _, done2 = form("/oauth/authorize?format=json",
+                            {"request_uri": par2["request_uri"], "handle": HANDLE,
+                             "password": "s3cret-pw-long"})
+        check("confidential authorize", st == 200 and "code" in done2, str(done2)[:100])
+        code2 = done2["code"]
+
+        def conf_exchange(fields, nonce=None):
+            proof = dpop_proof("POST", token_url, nonce=nonce)
+            f2 = dict(fields)
+            f2["client_assertion_type"] = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            f2["client_assertion"] = client_assertion(token_url)
+            return form("/oauth/token", f2, dpop=proof)
+
+        st, hdrs, body2 = conf_exchange(
+            {"grant_type": "authorization_code", "code": code2,
+             "redirect_uri": CONF_REDIRECT, "code_verifier": verifier2})
+        if st == 400 and body2.get("error") == "use_dpop_nonce":
+            n = hget(hdrs, "dpop-nonce")
+            st, _, body2 = conf_exchange(
+                {"grant_type": "authorization_code", "code": code2,
+                 "redirect_uri": CONF_REDIRECT, "code_verifier": verifier2}, nonce=n)
+        check("confidential token exchange", st == 200 and body2.get("sub") == did,
+              str(body2)[:140])
 
     if fails:
         print("FAILURES:", fails)

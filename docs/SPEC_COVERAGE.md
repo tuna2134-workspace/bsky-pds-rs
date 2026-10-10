@@ -13,7 +13,10 @@
 | createSession / refreshSession | ✅ (互換) | argon2 検証・HS256 署名ペア (access 1h/refresh 7d)。refresh は回転 |
 | getSession | ✅ | Lexicon 形 (トークンなし)。OAuth 時 email は `transition:email` 要求 |
 | createInviteCode(s) | ✅ | 管理者トークン必須 |
-| requestPasswordReset / resetPassword | 🚧 | SMTP 配線と同時実装 |
+| requestPasswordReset / resetPassword | ✅ | ハッシュ化トークン (1h)・列挙耐性・SMTP/log 配送 |
+| requestEmailConfirmation / confirmEmail / updateEmail | ✅ | 24h トークン・単発・SMTP/log 配送 |
+| deleteAccount | ✅ | パスワード要求・全消去・`#account deleted` |
+| listReposByCollection | ✅ | コレクション逆引き (DID カーソル) |
 | checkAccountStatus | 🚧 | |
 | activateAccount / deactivateAccount | ✅ | 自アカウントの停止・再開。`#account` 発火・非 active は書き込み不可 |
 | confirmEmail / requestEmailConfirmation / requestEmailUpdate / updateEmail | ⬜ | SMTP と同時実装 |

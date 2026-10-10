@@ -23,8 +23,12 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.server.getSession", get(get_session))
         .route("/xrpc/com.atproto.server.createInviteCode", post(create_invite_code))
         .route("/xrpc/com.atproto.server.createInviteCodes", post(create_invite_codes))
-        .route("/xrpc/com.atproto.server.requestPasswordReset", post(not_implemented))
-        .route("/xrpc/com.atproto.server.resetPassword", post(not_implemented))
+        .route("/xrpc/com.atproto.server.requestPasswordReset", post(request_password_reset))
+        .route("/xrpc/com.atproto.server.resetPassword", post(reset_password))
+        .route("/xrpc/com.atproto.server.requestEmailConfirmation", post(request_email_confirmation))
+        .route("/xrpc/com.atproto.server.confirmEmail", post(confirm_email))
+        .route("/xrpc/com.atproto.server.updateEmail", post(update_email))
+        .route("/xrpc/com.atproto.server.deleteAccount", post(delete_account))
         .route("/xrpc/com.atproto.server.checkAccountStatus", get(not_implemented_get))
         .route("/xrpc/com.atproto.server.deactivateAccount", post(deactivate_account))
         .route("/xrpc/com.atproto.server.activateAccount", post(activate_account))
@@ -510,4 +514,342 @@ async fn set_account_status(env: &worker::Env, did: &str, active: bool, status: 
         .map_err(|e| XrpcError::internal(e.to_string()))?;
     crate::firehose::emit_account(env, did, active, if active { None } else { Some(status) }).await?;
     Ok(())
+}
+
+// --- email + password-reset + deletion ---
+
+/// Issue a single-use email token (stored hashed).
+async fn issue_email_token(
+    env: &worker::Env,
+    did: &str,
+    purpose: &str,
+    email: Option<&str>,
+    ttl_secs: i64,
+) -> XrpcResult<String> {
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let token = crate::keys::random_b64u32().map_err(|e| XrpcError::internal(e.to_string()))?;
+    let now = pds_env::now_iso();
+    // Expiry as ISO: now + ttl (recompute via millis to stay fixed-width).
+    let exp_ms = worker::Date::now().as_millis() as i64 + ttl_secs * 1000;
+    let exp = iso_from_millis(exp_ms);
+    db.prepare("INSERT INTO email_token (did, purpose, token_hash, email, expires_at, used_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6)")
+        .bind(&[
+            did.into(),
+            purpose.into(),
+            crate::keys::sha256_hex(&token).into(),
+            email.unwrap_or("").into(),
+            exp.into(),
+            now.into(),
+        ])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(token)
+}
+
+fn iso_from_millis(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_ymd(days + 719_468);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60, millis)
+}
+
+fn civil_ymd(z: i64) -> (i64, u32, u32) {
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[derive(serde::Deserialize)]
+struct TokenRow {
+    did: String,
+    email: String,
+    expires_at: String,
+}
+
+/// Verify + burn an email token. Returns (did, email-field).
+async fn consume_email_token(
+    env: &worker::Env,
+    purpose: &str,
+    token: &str,
+) -> XrpcResult<(String, String)> {
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let row: Option<TokenRow> = db
+        .prepare("SELECT did, email, expires_at FROM email_token WHERE purpose = ?1 AND token_hash = ?2 AND used_at IS NULL")
+        .bind(&[purpose.into(), crate::keys::sha256_hex(token).into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let Some(row) = row else {
+        return Err(XrpcError::bad_request("InvalidToken", "bad or expired token"));
+    };
+    if row.expires_at <= pds_env::now_iso() {
+        return Err(XrpcError::bad_request("InvalidToken", "token expired"));
+    }
+    let now = pds_env::now_iso();
+    db.prepare("UPDATE email_token SET used_at = ?1 WHERE purpose = ?2 AND token_hash = ?3")
+        .bind(&[now.into(), purpose.into(), crate::keys::sha256_hex(token).into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok((row.did, row.email))
+}
+
+fn valid_email(email: &str) -> bool {
+    email.len() >= 3 && email.len() <= 320 && {
+        match email.split_once('@') {
+            Some((local, domain)) => {
+                !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+                    && email.bytes().all(|b| !b.is_ascii_whitespace())
+            }
+            None => false,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RequestEmailConfirmationReq {
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[worker::send]
+async fn request_email_confirmation(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<RequestEmailConfirmationReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.requestEmailConfirmation").await?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct EmailRow {
+        email: Option<String>,
+        handle: String,
+    }
+    let row: Option<EmailRow> = db
+        .prepare("SELECT email, handle FROM account WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let Some(acct) = row else {
+        return Err(XrpcError::unauthorized("unknown account"));
+    };
+    let target = req.email.or(acct.email).unwrap_or_default();
+    if !valid_email(&target) {
+        return Err(XrpcError::bad_request("InvalidEmail", "no usable email on file"));
+    }
+    let token = issue_email_token(&s.env, &caller.did, "confirm", Some(&target), 24 * 3600).await?;
+    let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let text = format!(
+        "Confirm your email for @{handle} on {host} with this code:\n\n{token}\n\nIt expires in 24 hours. If you did not request this, ignore this message.\n",
+        handle = acct.handle,
+        host = cfg.hostname
+    );
+    crate::email::send_email(&s.env, &target, "Confirm your email", &text).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+#[derive(serde::Deserialize)]
+struct ConfirmEmailReq {
+    email: String,
+    token: String,
+}
+
+#[worker::send]
+async fn confirm_email(State(s): State<ServerState>, Json(req): Json<ConfirmEmailReq>) -> XrpcResult<Json<serde_json::Value>> {
+    let (did, _) = consume_email_token(&s.env, "confirm", &req.token).await?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct WhoRow {
+        did: String,
+    }
+    // The email in the request must belong to the token holder.
+    let row: Option<WhoRow> = db
+        .prepare("SELECT did FROM account WHERE email = ?1")
+        .bind(&[req.email.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    match row {
+        Some(r) if r.did == did => {}
+        _ => return Err(XrpcError::bad_request("InvalidToken", "email does not match token")),
+    }
+    db.prepare("UPDATE account SET email_confirmed = 1 WHERE did = ?1")
+        .bind(&[did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({})))
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateEmailReq {
+    email: String,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[worker::send]
+async fn update_email(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<UpdateEmailReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.updateEmail").await?;
+    if !valid_email(&req.email) {
+        return Err(XrpcError::bad_request("InvalidEmail", "bad email address"));
+    }
+    // With a confirmation token, apply immediately; otherwise stage + send code.
+    if let Some(token) = req.token.as_deref() {
+        let (did, token_email) = consume_email_token(&s.env, "update", token).await?;
+        if did != caller.did || token_email != req.email {
+            return Err(XrpcError::bad_request("InvalidToken", "token does not match"));
+        }
+        let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+        db.prepare("UPDATE account SET email = ?1, email_confirmed = 1 WHERE did = ?2")
+            .bind(&[req.email.clone().into(), caller.did.into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .run()
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        return Ok(Json(serde_json::json!({})));
+    }
+    let token = issue_email_token(&s.env, &caller.did, "update", Some(&req.email), 24 * 3600).await?;
+    let text = format!("Confirm your new email address with this code:\n\n{token}\n\nIt expires in 24 hours.\n");
+    crate::email::send_email(&s.env, &req.email, "Confirm your new email", &text).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+#[derive(serde::Deserialize)]
+struct RequestPasswordResetReq {
+    email: String,
+}
+
+#[worker::send]
+async fn request_password_reset(State(s): State<ServerState>, Json(req): Json<RequestPasswordResetReq>) -> XrpcResult<Json<serde_json::Value>> {
+    // Never reveal whether the email exists.
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct DidRow2 {
+        did: String,
+    }
+    let row: Option<DidRow2> = db
+        .prepare("SELECT did FROM account WHERE email = ?1")
+        .bind(&[req.email.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    if let Some(r) = row {
+        let token = issue_email_token(&s.env, &r.did, "reset", None, 3600).await?;
+        let text = format!("Reset your password with this code:\n\n{token}\n\nIt expires in 1 hour. If you did not request this, ignore this message.\n");
+        let _ = crate::email::send_email(&s.env, &req.email, "Reset your password", &text).await;
+    }
+    Ok(Json(serde_json::json!({})))
+}
+
+#[derive(serde::Deserialize)]
+struct ResetPasswordReq {
+    token: String,
+    password: String,
+}
+
+#[worker::send]
+async fn reset_password(State(s): State<ServerState>, Json(req): Json<ResetPasswordReq>) -> XrpcResult<Json<serde_json::Value>> {
+    let (did, _) = consume_email_token(&s.env, "reset", &req.token).await?;
+    let hash = crate::oauth::hash_password(&req.password)?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    db.prepare("UPDATE account SET password_hash = ?1 WHERE did = ?2")
+        .bind(&[hash.into(), did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({})))
+}
+
+#[derive(serde::Deserialize)]
+struct DeleteAccountReq {
+    #[serde(default)]
+    did: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// Delete your own account (password required): wipes records, blobs, repo
+/// state and sessions, then emits `#account` deleted. PLC tombstoning is a
+/// separate rotation-key operation (see ROADMAP §4).
+#[worker::send]
+async fn delete_account(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteAccountReq>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.server.deleteAccount").await?;
+    let did = req.did.clone().unwrap_or_else(|| caller.did.clone());
+    if did != caller.did {
+        return Err(XrpcError::forbidden("AuthFailed", "can only delete your own account"));
+    }
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct PwRow {
+        password_hash: Option<String>,
+    }
+    let row: Option<PwRow> = db
+        .prepare("SELECT password_hash FROM account WHERE did = ?1")
+        .bind(&[did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let Some(pw) = row else {
+        return Err(XrpcError::not_found("AccountNotFound", "unknown account"));
+    };
+    let password = req.password.ok_or_else(|| XrpcError::bad_request("InvalidPassword", "password required"))?;
+    match pw.password_hash {
+        Some(h) if crate::oauth::verify_password(&h, &password) => {}
+        _ => return Err(XrpcError::new(axum::http::StatusCode::UNAUTHORIZED, "AuthenticationRequired", "bad password")),
+    }
+    // Blobs: drop R2 objects, then all relational state.
+    if let Ok(bucket) = s.env.bucket("BLOBS") {
+        if let Ok(listed) = bucket.list().prefix(format!("{did}/")).execute().await {
+            for obj in listed.objects() {
+                let _ = bucket.delete(&obj.key()).await;
+            }
+        }
+    }
+    // Wipe relational state (kept explicit per table for audit).
+    for stmt in [
+        "DELETE FROM record WHERE did = ?1",
+        "DELETE FROM blob WHERE did = ?1",
+        "DELETE FROM repo_root WHERE did = ?1",
+        "DELETE FROM firehose_event WHERE did = ?1",
+        "DELETE FROM oauth_token WHERE did = ?1",
+        "DELETE FROM email_token WHERE did = ?1",
+        "DELETE FROM account WHERE did = ?1",
+    ] {
+        db.prepare(stmt)
+            .bind(&[did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .run()
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+    }
+    crate::firehose::emit_account(&s.env, &did, false, Some("deleted")).await?;
+    Ok(Json(serde_json::json!({})))
 }

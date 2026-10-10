@@ -739,3 +739,289 @@ mod tests {
         assert!(parse_car(&bad).is_err());
     }
 }
+
+// ---------- consumer-side diff verification (operation inversion) ----------
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OpAction {
+    Create,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+pub struct FirehoseOp {
+    pub action: OpAction,
+    pub path: Vec<u8>,
+    pub cid: Option<Cid>,
+    pub prev: Option<Cid>,
+}
+
+/// Parse `#commit` ops from their JSON form (`cid`/`prev` as `$link`).
+pub fn parse_ops(ops: &[serde_json::Value]) -> Result<Vec<FirehoseOp>, MstError> {
+    let bad = |m: &str| MstError::Invalid(m.into());
+    let mut out = Vec::with_capacity(ops.len());
+    if ops.len() > 200 {
+        return Err(bad("too many ops"));
+    }
+    for op in ops {
+        let action = match op.get("action").and_then(|v| v.as_str()) {
+            Some("create") => OpAction::Create,
+            Some("update") => OpAction::Update,
+            Some("delete") => OpAction::Delete,
+            _ => return Err(bad("bad op action")),
+        };
+        let path = op
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| bad("op missing path"))?
+            .as_bytes()
+            .to_vec();
+        if path.is_empty() || path.len() > 1024 {
+            return Err(bad("bad op path"));
+        }
+        let link = |name: &str| -> Result<Option<Cid>, MstError> {
+            match op.get(name) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => {
+                    let s = v
+                        .get("$link")
+                        .and_then(|l| l.as_str())
+                        .ok_or_else(|| bad("op link must be $link"))?;
+                    Cid::parse(s).map(Some).map_err(|_| bad("bad op cid"))
+                }
+            }
+        };
+        out.push(FirehoseOp { action, path, cid: link("cid")?, prev: link("prev")? });
+    }
+    Ok(out)
+}
+
+/// Verify a `#commit` CAR slice by operation inversion (spec §Repository Diffs):
+/// rewind every op against the new tree and require the rebuilt root to equal
+/// `prev_data`. With `prev_data == None` (genesis/resync boundary) only
+/// internal consistency is checked.
+///
+/// Signature verification is intentionally separate (see `verify_commit`):
+/// callers verify with the account's current key, refreshing identity first.
+pub fn verify_commit_slice(
+    car_bytes: &[u8],
+    rev: &str,
+    ops: &[FirehoseOp],
+    prev_data: Option<&Cid>,
+) -> Result<(), MstError> {
+    let bad = |m: &str| MstError::Invalid(m.into());
+    if car_bytes.len() > 2_000_000 {
+        return Err(bad("slice exceeds 2MB"));
+    }
+    let (roots, blocks) = parse_car(car_bytes)?;
+    let root = roots.into_iter().next().ok_or_else(|| bad("no roots"))?;
+    let (commit_cid, commit_bytes) = blocks.first().cloned().ok_or_else(|| bad("no commit block"))?;
+    if commit_cid != root {
+        return Err(bad("first block must be the commit"));
+    }
+    let commit = parse_commit(&commit_bytes)?;
+    if commit.rev != rev {
+        return Err(bad("rev mismatch"));
+    }
+    // Index blocks; parse every node.
+    let mut nodes: std::collections::HashMap<String, ParsedNode> = std::collections::HashMap::new();
+    let mut records: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for (cid, bytes) in blocks.iter().skip(1) {
+        if bytes.len() > 1_000_000 {
+            return Err(bad("block too large"));
+        }
+        match parse_node(bytes) {
+            Ok(node) => {
+                nodes.insert(cid.to_string(), node);
+            }
+            Err(_) => {
+                records.insert(cid.to_string(), bytes.clone());
+            }
+        }
+    }
+    // Walk the new tree to recover the full key set.
+    let mut state: std::collections::BTreeMap<Vec<u8>, Cid> = std::collections::BTreeMap::new();
+    let mut stack = vec![commit.data.clone()];
+    let mut seen_nodes = std::collections::HashSet::new();
+    while let Some(cid) = stack.pop() {
+        if !seen_nodes.insert(cid.to_string()) {
+            continue;
+        }
+        let node = nodes.get(&cid.to_string()).ok_or_else(|| bad("missing MST node"))?;
+        if let Some(left) = &node.left {
+            stack.push(left.clone());
+        }
+        for e in &node.entries {
+            state.insert(e.key.clone(), e.value.clone());
+            if let Some(right) = &e.right {
+                stack.push(right.clone());
+            }
+        }
+    }
+    // Rewind each op (reverse application) and check record presence.
+    // Reverse rules: create -> remove path (must hold op.cid);
+    // update -> restore prev (current must hold op.cid); delete -> re-add prev.
+    // update/delete without `prev` cannot be rewound: relay-tolerated, but
+    // this strict verifier rejects (our producer always emits `prev`).
+    for op in ops {
+        match op.action {
+            OpAction::Create => {
+                let new_cid = op.cid.as_ref().ok_or_else(|| bad("create needs cid"))?;
+                let bytes = records.get(&new_cid.to_string()).ok_or_else(|| bad("missing record block"))?;
+                if Cid::dag_cbor(bytes) != *new_cid {
+                    return Err(bad("record block mismatch"));
+                }
+                match state.remove(&op.path) {
+                    Some(cur) if &cur == new_cid => {}
+                    _ => return Err(bad("create rewind mismatch")),
+                }
+            }
+            OpAction::Update => {
+                let new_cid = op.cid.as_ref().ok_or_else(|| bad("update needs cid"))?;
+                let prev = op.prev.as_ref().ok_or_else(|| bad("update prev required for inversion"))?;
+                let bytes = records.get(&new_cid.to_string()).ok_or_else(|| bad("missing record block"))?;
+                if Cid::dag_cbor(bytes) != *new_cid {
+                    return Err(bad("record block mismatch"));
+                }
+                match state.get(&op.path) {
+                    Some(cur) if cur == new_cid => {}
+                    _ => return Err(bad("update rewind mismatch")),
+                }
+                state.insert(op.path.clone(), prev.clone());
+            }
+            OpAction::Delete => {
+                let prev = op.prev.as_ref().ok_or_else(|| bad("delete prev required for inversion"))?;
+                if state.insert(op.path.clone(), prev.clone()).is_some() {
+                    return Err(bad("delete rewind mismatch"));
+                }
+            }
+        }
+    }
+    if let Some(prev_data) = prev_data {
+        let entries: Vec<MstEntry> = state
+            .into_iter()
+            .map(|(key, cid)| MstEntry { key, cid })
+            .collect();
+        let rebuilt = build(&entries)?;
+        if rebuilt.root != *prev_data {
+            return Err(bad("inversion root mismatch"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod inversion_tests {
+    use super::*;
+
+    fn rec_bytes(key: &str, tag: &str) -> (Cid, Vec<u8>) {
+        let v = serde_json::json!({"$type": "app.bsky.feed.post", "text": tag, "k": key});
+        let bytes = crate::cbor::encode_json(&v).unwrap();
+        let cid = Cid::dag_cbor(&bytes);
+        (cid, bytes)
+    }
+
+    fn build_tree(pairs: &[(&str, &str, &str)]) -> (BuiltTree, std::collections::HashMap<String, (Cid, Vec<u8>)>) {
+        // (path, tag) with tag selecting record content; returns tree + record blocks.
+        let mut entries = Vec::new();
+        let mut recs = std::collections::HashMap::new();
+        for (path, tag, _) in pairs {
+            let (cid, bytes) = rec_bytes(path, tag);
+            entries.push(MstEntry { key: path.as_bytes().to_vec(), cid: cid.clone() });
+            recs.insert(path.to_string(), (cid, bytes));
+        }
+        (build(&entries).unwrap(), recs)
+    }
+
+    fn commit_for(did: &str, rev: &str, root: &Cid) -> (Vec<u8>, Cid) {
+        sign_commit(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            did,
+            rev,
+            root,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn inversion_roundtrip_batch() {
+        // Start: 3 records. Batch: create D, update B, delete C.
+        let (old_tree, mut recs) = build_tree(&[
+            ("app.bsky.feed.post/aaaa", "v1", ""),
+            ("app.bsky.feed.post/bbbb", "v1", ""),
+            ("app.bsky.feed.post/cccc", "v1", ""),
+        ]);
+        let (b_cid, _) = recs["app.bsky.feed.post/bbbb"].clone();
+        let (c_cid, _) = recs["app.bsky.feed.post/cccc"].clone();
+        let (d_cid, d_bytes) = rec_bytes("app.bsky.feed.post/dddd", "v1");
+        let (b2_cid, b2_bytes) = rec_bytes("app.bsky.feed.post/bbbb", "v2");
+        recs.insert("app.bsky.feed.post/dddd".into(), (d_cid.clone(), d_bytes.clone()));
+        recs.insert("app.bsky.feed.post/bbbb".into(), (b2_cid.clone(), b2_bytes.clone()));
+
+        let mut new_entries = vec![
+            MstEntry { key: b"app.bsky.feed.post/aaaa".to_vec(), cid: recs["app.bsky.feed.post/aaaa"].0.clone() },
+            MstEntry { key: b"app.bsky.feed.post/bbbb".to_vec(), cid: b2_cid.clone() },
+            MstEntry { key: b"app.bsky.feed.post/dddd".to_vec(), cid: d_cid.clone() },
+        ];
+        new_entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let new_tree = build(&new_entries).unwrap();
+        let (commit_bytes, commit_cid) = commit_for("did:plc:test", "rev2", &new_tree.root);
+
+        // Slice: commit + ALL new nodes + changed records only.
+        let mut blocks = vec![(commit_cid.clone(), commit_bytes.clone())];
+        for n in &new_tree.nodes_preorder {
+            blocks.push((n.cid.clone(), n.bytes.clone()));
+        }
+        blocks.push((d_cid.clone(), d_bytes.clone()));
+        blocks.push((b2_cid.clone(), b2_bytes.clone()));
+        let car = build_car(&commit_cid, &blocks);
+
+        let ops = parse_ops(&[
+            serde_json::json!({"action": "create", "path": "app.bsky.feed.post/dddd", "cid": {"$link": d_cid.to_string()}}),
+            serde_json::json!({"action": "update", "path": "app.bsky.feed.post/bbbb", "cid": {"$link": b2_cid.to_string()}, "prev": {"$link": b_cid.to_string()}}),
+            serde_json::json!({"action": "delete", "path": "app.bsky.feed.post/cccc", "prev": {"$link": c_cid.to_string()}}),
+        ])
+        .unwrap();
+        verify_commit_slice(&car, "rev2", &ops, Some(&old_tree.root)).unwrap();
+    }
+
+    #[test]
+    fn inversion_rejects_tampering() {
+        let (old_tree, mut recs) = build_tree(&[
+            ("app.bsky.feed.post/aaaa", "v1", ""),
+            ("app.bsky.feed.post/bbbb", "v1", ""),
+        ]);
+        let (b_cid, _) = recs["app.bsky.feed.post/bbbb"].clone();
+        let (b2_cid, b2_bytes) = rec_bytes("app.bsky.feed.post/bbbb", "v2");
+        recs.insert("app.bsky.feed.post/bbbb".into(), (b2_cid.clone(), b2_bytes.clone()));
+        let new_entries = vec![
+            MstEntry { key: b"app.bsky.feed.post/aaaa".to_vec(), cid: recs["app.bsky.feed.post/aaaa"].0.clone() },
+            MstEntry { key: b"app.bsky.feed.post/bbbb".to_vec(), cid: b2_cid.clone() },
+        ];
+        let new_tree = build(&new_entries).unwrap();
+        let (commit_bytes, commit_cid) = commit_for("did:plc:test", "rev2", &new_tree.root);
+        let mut blocks = vec![(commit_cid.clone(), commit_bytes.clone())];
+        for n in &new_tree.nodes_preorder {
+            blocks.push((n.cid.clone(), n.bytes.clone()));
+        }
+        blocks.push((b2_cid.clone(), b2_bytes.clone()));
+        let car = build_car(&commit_cid, &blocks);
+        let good_op = serde_json::json!({"action": "update", "path": "app.bsky.feed.post/bbbb", "cid": {"$link": b2_cid.to_string()}, "prev": {"$link": b_cid.to_string()}});
+        let ops = parse_ops(&[good_op.clone()]).unwrap();
+        verify_commit_slice(&car, "rev2", &ops, Some(&old_tree.root)).unwrap();
+
+        // Wrong prev root.
+        let other = build(&[MstEntry { key: b"x/y".to_vec(), cid: b2_cid.clone() }]).unwrap();
+        assert!(verify_commit_slice(&car, "rev2", &ops, Some(&other.root)).is_err());
+        // Wrong prev op CID.
+        let bad_prev = serde_json::json!({"action": "update", "path": "app.bsky.feed.post/bbbb", "cid": {"$link": b2_cid.to_string()}, "prev": {"$link": b2_cid.to_string()}});
+        let bad_ops = parse_ops(&[bad_prev]).unwrap();
+        assert!(verify_commit_slice(&car, "rev2", &bad_ops, Some(&old_tree.root)).is_err());
+        // Missing record block.
+        let car_no_rec = build_car(&commit_cid, &[(commit_cid.clone(), commit_bytes.clone())]);
+        assert!(verify_commit_slice(&car_no_rec, "rev2", &ops, Some(&old_tree.root)).is_err());
+        // Resync boundary (no prev): internal consistency passes, chain unchecked.
+        verify_commit_slice(&car, "rev2", &ops, None).unwrap();
+    }
+}
