@@ -413,6 +413,81 @@ def main():
                   {"identifier": did})
     check("refreshIdentity", st == 200 and dd["did"] == did, "")
 
+    # createAccount shape: didDoc present
+    st, desc = call("GET", f"/xrpc/com.atproto.server.getSession", auth=auth)
+    check("getSession didDoc", st == 200 and isinstance(desc.get("didDoc"), dict)
+          and desc.get("emailAuthFactor") is False, str(desc)[:120])
+
+    # recoveryKey + plcOp migration import (client-signed genesis op)
+    import sys as _sys
+    _sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+    from atproto_crypto import es256k_sign, b64u as _b64u
+    from atproto_crypto import pt_mul, K256_G, K256_P
+    mig_priv = int.from_bytes(__import__("os").urandom(32), "big") % (
+        0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141)
+    mig_Q = pt_mul(mig_priv, K256_G, K256_P, 0)
+    mig_pub_hex = ("02" if mig_Q[1] % 2 == 0 else "03") + "%064x" % mig_Q[0]
+    B58A = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+    def _b58enc(raw):
+        n = int.from_bytes(raw, "big")
+        out = ""
+        while n:
+            n, r = divmod(n, 58)
+            out = B58A[r] + out
+        return "1" * (len(raw) - len(raw.lstrip(b"\x00"))) + out
+
+    mig_rot_dk = "did:key:z" + _b58enc(bytes([0xE7, 0x01]) + bytes.fromhex(mig_pub_hex))
+    new_handle = f"migop-{TAG}.example.com"
+    unsigned = {"type": "plc_operation",
+                "rotationKeys": [mig_rot_dk],
+                "verificationMethods": {"atproto": mig_rot_dk},
+                "alsoKnownAs": [f"at://{new_handle}"],
+                "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer",
+                                             "endpoint": "https://localhost"}}}
+    # canonical CBOR (length-first keys) then sign
+
+    def _head(major, n):
+        if n <= 23:
+            return bytes([major << 5 | n])
+        if n <= 0xFF:
+            return bytes([major << 5 | 24, n])
+        if n <= 0xFFFF:
+            return bytes([major << 5 | 25]) + n.to_bytes(2, "big")
+        return bytes([major << 5 | 26]) + n.to_bytes(4, "big")
+
+    def _enc(v):
+        if v is None:
+            return b"\xf6"
+        if isinstance(v, str):
+            bb = v.encode()
+            return _head(3, len(bb)) + bb
+        if isinstance(v, list):
+            return _head(4, len(v)) + b"".join(_enc(x) for x in v)
+        if isinstance(v, dict):
+            items = sorted(v.items(), key=lambda kv: (len(kv[0]), kv[0]))
+            return _head(5, len(v)) + b"".join(_enc(k) + _enc(x) for k, x in items)
+        raise AssertionError(type(v))
+
+    import hashlib as _hl
+    digest = _hl.sha256(_enc(unsigned)).digest()
+    sig = es256k_sign(digest, mig_priv)
+    op = dict(unsigned, sig=_b64u(sig))
+    op_did = "did:plc:" + __import__("base64").b32encode(
+        _hl.sha256(_enc(op)).digest()).decode().lower().rstrip("=")[:24]
+    st, acct_m = call("POST", "/xrpc/com.atproto.server.createAccount",
+                         {"handle": new_handle, "email": f"migop-{TAG}@example.com",
+                          "password": "s3cret-pw-long", "did": op_did, "plcOp": op,
+                          "recoveryKey": mig_rot_dk}, auth="Basic " + ADMIN)
+    check("plcOp migration import", st == 200 and acct_m.get("did") == op_did,
+          str(acct_m)[:120])
+    # duplicate handle now surfaces HandleNotAvailable
+    st, body = call("POST", "/xrpc/com.atproto.server.createAccount",
+                       {"handle": new_handle, "email": f"dup-{TAG}@example.com",
+                        "password": "s3cret-pw-long"}, auth="Basic " + ADMIN)
+    check("HandleNotAvailable", st == 400 and body.get("error") == "HandleNotAvailable",
+          str(body)[:80])
+
     # delete by token
     st, _ = call("POST", "/xrpc/com.atproto.server.requestAccountDelete", {}, auth=auth)
     check("requestAccountDelete", st == 200, "")

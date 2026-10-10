@@ -9,7 +9,9 @@
 |---|---|---|
 | describeServer | ✅ | ドメイン/招待要否を返す |
 | createAccount | ✅ | D1 登録・空 repo 初期化・互換 JWT 返却 |
-| createAccount | ✅ | argon2id ハッシュ保存・k256 署名鍵生成・genesis 署名 commit・#account/#sync 発火。handle/email UNIQUE |
+| createAccount | ✅ | argon2id・k256 鍵・genesis commit・#account/#sync。`recoveryKey`/`plcOp` 移行対応・didDoc 返却・HandleNotAvailable |
+| describeServer | ✅ | +blobUploadLimit |
+| getSession | ✅ | +didDoc/emailAuthFactor/status |
 | createSession / refreshSession | ✅ (互換) | argon2 検証・HS256 署名ペア (access 1h/refresh 7d)。refresh は回転 |
 | getSession | ✅ | Lexicon 形 (トークンなし)。OAuth 時 email は `transition:email` 要求 |
 | createInviteCode(s) | ✅ | 管理者トークン必須 |

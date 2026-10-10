@@ -176,8 +176,11 @@ fn encode_into(v: &DagCbor, out: &mut Vec<u8>) {
         }
         DagCbor::Link(cid) => {
             // Tag 42 + byte string of raw CID bytes.
+            // Spec (cbor-tag42, DRISL): a null byte 0x00 is prepended to the
+            // binary CID before storing in CBOR, for historical reasons.
             head(out, 6, 42);
-            head(out, 2, cid.bytes.len() as u64);
+            head(out, 2, cid.bytes.len() as u64 + 1);
+            out.push(0x00);
             out.extend_from_slice(&cid.bytes);
         }
     }
@@ -245,7 +248,14 @@ impl<'a> Decoder<'a> {
                     return Err(CborError::Invalid(format!("unsupported tag {tag}")));
                 }
                 match self.decode_one()? {
-                    DagCbor::Bytes(cid_bytes) => Ok(DagCbor::Link(Cid::from_bytes(&cid_bytes)?)),
+                    // Spec form carries a 0x00 prefix; pre-spec links without
+                    // it are still accepted for robustness (same CID either way).
+                    DagCbor::Bytes(mut cid_bytes) => {
+                        if cid_bytes.first() == Some(&0x00) && cid_bytes.len() > 1 {
+                            cid_bytes.remove(0);
+                        }
+                        Ok(DagCbor::Link(Cid::from_bytes(&cid_bytes)?))
+                    }
                     _ => Err(CborError::Invalid("tag 42 over non-bytes".into())),
                 }
             }
@@ -372,6 +382,12 @@ mod tests {
         let link = serde_json::json!({ "$link": cid.to_string() });
         let bytes = encode_json(&link).unwrap();
         assert_eq!(&bytes[..2], &[0xd8, 0x2a]); // tag 42
+        // cbor-tag42: null byte prepended to the binary CID.
+        let cid_bytes = Cid::dag_cbor(b"linked-record").bytes;
+        let mut inner = vec![0x00];
+        inner.extend_from_slice(&cid_bytes);
+        assert_eq!(&bytes[2..4], &[0x58, inner.len() as u8]); // bytes(37)
+        assert_eq!(&bytes[4..], &inner[..]);
         let back = to_json(&decode_exact(&bytes).unwrap());
         assert_eq!(back, link);
 

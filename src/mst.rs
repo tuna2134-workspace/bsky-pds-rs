@@ -615,7 +615,7 @@ mod tests {
         let tree = build(&entries).unwrap();
         assert_eq!(
             tree.root.to_string(),
-            "bafyreiencqzo2owznbniw6u4led7nbyag54h2xqbzim4kajvre37fucwvy"
+            "bafyreihcavsbxr4traos5tvkcgi2nvle75gg53rog6erndqzp3vnwn2djy"
         );
     }
 
@@ -687,7 +687,7 @@ mod tests {
         let u = unsigned_commit_bytes("did:plc:test", "223mxiaevlz62", &data);
         assert_eq!(
             hex::encode(&u),
-            "a5636469646c6469643a706c633a74657374637265766d3232336d78696165766c7a36326464617461d82a582401711220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6470726576f66776657273696f6e03"
+            "a5636469646c6469643a706c633a74657374637265766d3232336d78696165766c7a36326464617461d82a58250001711220aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa6470726576f66776657273696f6e03"
         );
     }
 

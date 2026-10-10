@@ -56,6 +56,8 @@ struct DescribeServerResp {
     invite_code_required: bool,
     #[serde(rename = "phoneVerificationRequired")]
     phone_verification_required: bool,
+    #[serde(rename = "blobUploadLimit")]
+    blob_upload_limit: i64,
     links: serde_json::Value,
     #[serde(rename = "contact")]
     contact: serde_json::Value,
@@ -69,6 +71,7 @@ async fn describe_server(State(s): State<ServerState>) -> XrpcResult<Json<Descri
         available_user_domains: vec![cfg.hostname.clone()],
         invite_code_required: cfg.invite_required,
         phone_verification_required: false,
+        blob_upload_limit: cfg.blob_upload_limit as i64,
         links: serde_json::json!({}),
         contact: serde_json::json!({}),
     }))
@@ -89,6 +92,10 @@ struct CreateAccountReq {
     invite_code: Option<String>,
     #[serde(rename = "did")]
     did: Option<String>,
+    #[serde(rename = "recoveryKey")]
+    recovery_key: Option<String>,
+    #[serde(rename = "plcOp")]
+    plc_op: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -107,6 +114,8 @@ struct CreateAccountResp {
     refresh_jwt: String,
     #[serde(rename = "active")]
     active: bool,
+    #[serde(rename = "didDoc")]
+    did_doc: serde_json::Value,
 }
 
 #[worker::send]
@@ -156,17 +165,35 @@ async fn create_account(
     let (priv_hex, pub_hex) = crate::keys::generate_k256().map_err(|e| XrpcError::internal(e.to_string()))?;
     let (rot_priv_hex, rot_pub_hex) = crate::keys::generate_k256().map_err(|e| XrpcError::internal(e.to_string()))?;
 
-    // DID: caller-provided (migration/reservation), real PLC registration for
-    // public handles, or a local dev DID for loopback handles.
+    // Recovery key: user-held rotation key, highest PLC priority when given.
+    // Must be a did:key the PDS can parse (private half stays with the user).
+    let user_recovery_key: Option<String> = match req.recovery_key.as_deref() {
+        Some(k) => {
+            // Validate shape now; the directory enforces the rest on submit.
+            if !k.starts_with("did:key:z") {
+                return Err(XrpcError::bad_request("InvalidRequest", "recoveryKey must be a did:key"));
+            }
+            Some(k.to_string())
+        }
+        None => None,
+    };
+
+    // DID: caller-provided (migration/reservation, optionally with a signed
+    // plcOp), real PLC registration for public handles, or a local dev DID
+    // for loopback handles.
     let local_handle = req.handle == "localhost"
         || req.handle.ends_with(".localhost")
         || req.handle.starts_with("localhost:")
         || req.handle.starts_with("127.")
         || req.handle.starts_with("[::1]");
-    let did = match req.did {
+    let did = match req.did.clone() {
         Some(d) => {
             if !atproto::did::validate(&d) {
                 return Err(XrpcError::bad_request("InvalidDid", "did syntax invalid"));
+            }
+            if let Some(op) = req.plc_op.as_ref() {
+                // Migration import: verify the caller's signed op and submit it.
+                submit_account_plc_op(&s.env, &d, op).await?;
             }
             d
         }
@@ -175,14 +202,19 @@ async fn create_account(
         }
         None => {
             // Real federation path: build + sign a PLC genesis op and register it.
-            let rotation_did_key = crate::identity::did_key_encode(&rot_pub_hex, &crate::keys::Curve::K256)
+            let mut rotation_keys = Vec::new();
+            if let Some(user_key) = user_recovery_key.clone() {
+                rotation_keys.push(user_key);
+            }
+            let own_rotation = crate::identity::did_key_encode(&rot_pub_hex, &crate::keys::Curve::K256)
                 .map_err(|e| XrpcError::internal(e.to_string()))?;
+            rotation_keys.push(own_rotation);
             let signing_did_key = crate::identity::did_key_encode(&pub_hex, &crate::keys::Curve::K256)
                 .map_err(|e| XrpcError::internal(e.to_string()))?;
             let (did, op) = crate::identity::plc_genesis_op(
                 &rot_priv_hex,
+                rotation_keys,
                 &crate::identity::PlcGenesis {
-                    rotation_did_key,
                     signing_did_key,
                     handle: req.handle.clone(),
                     pds_endpoint: format!("https://{}", cfg.hostname),
@@ -193,6 +225,17 @@ async fn create_account(
             did
         }
     };
+
+    // Network availability: a non-local handle already pointing at a
+    // DIFFERENT did is taken (HandleNotAvailable). Unresolvable handles
+    // proceed; DNS proof completes out-of-band (see handleIsCorrect).
+    if !local_handle {
+        if let Ok(Some(other)) = crate::identity::resolve_handle_to_did(&s.env, &req.handle).await {
+            if Some(other.as_str()) != req.did.as_deref() {
+                return Err(XrpcError::bad_request("HandleNotAvailable", "handle already claimed on the network"));
+            }
+        }
+    }
 
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     // Adopt a reserved signing key when migrating in (reserveSigningKey).
@@ -229,13 +272,30 @@ async fn create_account(
                 Some(e) if !e.trim().is_empty() => e.into(),
                 _ => worker::wasm_bindgen::JsValue::NULL,
             };
-            [did.clone().into(), req.handle.clone().into(), email_js, password_hash.into(), priv_hex.into(), pub_hex.into(), rot_priv_hex.into(), now.clone().into()]
+            [did.clone().into(), req.handle.clone().into(), email_js, password_hash.into(), priv_hex.into(), pub_hex.clone().into(), rot_priv_hex.into(), now.clone().into()]
         })
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run()
         .await;
     if insert.is_err() {
-        return Err(XrpcError::bad_request("DuplicateAccount", "handle or DID already exists"));
+        // Distinguish handle vs DID collisions for lexicon error names.
+        let db2 = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+        #[derive(serde::Deserialize)]
+        struct TakenRow {
+            #[allow(dead_code)]
+            handle: String,
+        }
+        let taken: Option<TakenRow> = db2
+            .prepare("SELECT handle FROM account WHERE handle = ?1")
+            .bind(&[req.handle.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first(None)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        if taken.is_some() {
+            return Err(XrpcError::bad_request("HandleNotAvailable", "handle already taken"));
+        }
+        return Err(XrpcError::bad_request("InvalidDid", "DID already registered here"));
     }
     if let Some(code) = req.invite_code.as_deref() {
         if !admin_bypass {
@@ -262,13 +322,47 @@ async fn create_account(
 
     Ok(Json(CreateAccountResp {
         did: did.clone(),
-        handle: req.handle,
+        handle: req.handle.clone(),
         email: req.email,
         email_confirmed: false,
         access_jwt,
         refresh_jwt,
         active: true,
+        did_doc: crate::routes_repo::did_doc_for(
+            &did,
+            &req.handle,
+            Some(&pub_hex),
+            &format!("https://{}", cfg.hostname),
+        ),
     }))
+}
+
+/// Verify a caller-supplied migration PLC op and submit it for `did`:
+/// recomputes the DID from the signed bytes, requires it to match, checks
+/// the signature against the op's own rotation keys, then submits.
+async fn submit_account_plc_op(env: &worker::Env, did: &str, op: &serde_json::Value) -> XrpcResult<()> {
+    if op.get("type").and_then(|v| v.as_str()) != Some("plc_operation") {
+        return Err(XrpcError::bad_request("InvalidRequest", "only plc_operation supported here"));
+    }
+    let rotation_keys: Vec<String> = op
+        .get("rotationKeys")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|k| k.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    if rotation_keys.is_empty() {
+        return Err(XrpcError::bad_request("InvalidRequest", "rotationKeys required"));
+    }
+    // Recompute the DID from the signed bytes (self-certifying check).
+    let signed_bytes = crate::cbor::encode_json(op).map_err(|e| XrpcError::bad_request("InvalidRequest", e.to_string()))?;
+    let hash = crate::keys::sha256_of(&signed_bytes);
+    let b32 = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &hash).to_lowercase();
+    if did != format!("did:plc:{}", &b32[..24]) {
+        return Err(XrpcError::bad_request("IncompatibleDidDoc", "plcOp does not match the DID"));
+    }
+    crate::identity::verify_plc_op(op, &rotation_keys)
+        .map_err(|e| XrpcError::bad_request("IncompatibleDidDoc", e))?;
+    crate::identity::plc_submit(env, did, op).await?;
+    Ok(())
 }
 
 /// Issue a compat session pair (HS256, `PDS_JWT_SECRET`). Access 1h, refresh 7d.
@@ -456,8 +550,14 @@ struct GetSessionResp {
     email: Option<String>,
     #[serde(rename = "emailConfirmed")]
     email_confirmed: bool,
+    #[serde(rename = "emailAuthFactor")]
+    email_auth_factor: bool,
     #[serde(rename = "active")]
     active: bool,
+    #[serde(rename = "status", skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(rename = "didDoc", skip_serializing_if = "Option::is_none")]
+    did_doc: Option<serde_json::Value>,
 }
 
 #[worker::send]
@@ -480,12 +580,52 @@ async fn get_session(State(s): State<ServerState>, headers: HeaderMap) -> XrpcRe
     } else {
         a.email
     };
+    let active = a.active == 1;
+    // Lexicon status for inactive accounts (takendown/suspended/deactivated).
+    let status: Option<String> = if active {
+        None
+    } else {
+        let db2 = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+        #[derive(serde::Deserialize)]
+        struct StatusOnly {
+            status: String,
+        }
+        db2.prepare("SELECT status FROM account WHERE did = ?1")
+            .bind(&[a.did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first::<StatusOnly>(None)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .map(|r| r.status)
+    };
+    let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let db3 = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct PubRow {
+        signing_key_k256_pub_hex: Option<String>,
+    }
+    let pub_hex: Option<String> = db3
+        .prepare("SELECT signing_key_k256_pub_hex FROM account WHERE did = ?1")
+        .bind(&[a.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first::<PubRow>(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .and_then(|r| r.signing_key_k256_pub_hex);
     Ok(Json(GetSessionResp {
-        did: a.did,
-        handle: a.handle,
+        did: a.did.clone(),
+        handle: a.handle.clone(),
         email,
         email_confirmed: a.email_confirmed == 1,
-        active: a.active == 1,
+        email_auth_factor: false,
+        active,
+        status,
+        did_doc: Some(crate::routes_repo::did_doc_for(
+            &a.did,
+            &a.handle,
+            pub_hex.as_deref(),
+            &format!("https://{}", cfg.hostname),
+        )),
     }))
 }
 

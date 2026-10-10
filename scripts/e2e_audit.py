@@ -28,15 +28,7 @@ ADMIN = base64.b64encode(b"admin:change-me-admin").decode()
 PLC = {}
 TAMPER = {"on": False}
 
-B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-
-def b58dec(s):
-    n = 0
-    for ch in s:
-        n = n * 58 + B58.index(ch)
-    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
-    return b"\x00" * (len(s) - len(s.lstrip("1"))) + raw
+from atproto_crypto import b58dec, B58, K256_G, es256k_sign, b64u
 
 
 def head(major, n):
@@ -84,58 +76,21 @@ def did_key_pub(dk):
 
 
 EVIL_PRIV = 1
-EVIL_Q = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
-          0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+EVIL_Q = K256_G
 
 
 def pt_add(a, b):
-    P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    if a is None:
-        return b
-    if b is None:
-        return a
-    x1, y1 = a
-    x2, y2 = b
-    if x1 == x2 and (y1 + y2) % P == 0:
-        return None
-    if a == b:
-        s = (3 * x1 * x1) * pow(2 * y1, P - 2, P) % P
-    else:
-        s = ((y2 - y1) * pow(x2 - x1, P - 2, P)) % P
-    x3 = (s * s - x1 - x2) % P
-    return (x3, (s * (x1 - x3) - y1) % P)
+    from atproto_crypto import pt_add as _pa, K256_P
+    return _pa(a, b, K256_P, 0)
 
 
 def pt_mul(k, pt):
-    r = None
-    while k:
-        if k & 1:
-            r = pt_add(r, pt)
-        pt = pt_add(pt, pt)
-        k >>= 1
-    return r
+    from atproto_crypto import pt_mul as _pm, K256_P
+    return _pm(k, pt, K256_P, 0)
 
 
 def evil_sign(digest):
-    N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-    e = int.from_bytes(digest, "big")
-    while True:
-        k = int.from_bytes(os.urandom(32), "big") % N or 1
-        R = pt_mul(k, EVIL_Q)
-        r = R[0] % N
-        if r == 0:
-            continue
-        s = (pow(k, N - 2, N) * (e + r * EVIL_PRIV)) % N
-        if s == 0:
-            continue
-        half = N // 2
-        if s > half:
-            s = N - s
-        return r.to_bytes(32, "big") + s.to_bytes(32, "big")
-
-
-def b64u(b):
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    return es256k_sign(digest, EVIL_PRIV, low_s=True)
 
 
 def forged_op(prev_cid, rotation_did_key):

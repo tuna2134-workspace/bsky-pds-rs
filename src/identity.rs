@@ -376,17 +376,17 @@ pub fn did_key_decode_pub(did_key: &str) -> Result<(Curve, String), KeyError> {
 
 #[derive(Debug, Clone)]
 pub struct PlcGenesis {
-    pub rotation_did_key: String,
     pub signing_did_key: String,
     pub handle: String,
     pub pds_endpoint: String,
 }
 
 /// Build the unsigned genesis operation object (field order irrelevant: CBOR sorts).
-fn unsigned_genesis(gen: &PlcGenesis) -> serde_json::Value {
+/// `rotation_keys` is priority-ordered: caller recovery keys first, host key last.
+fn unsigned_genesis(rotation_keys: &[String], gen: &PlcGenesis) -> serde_json::Value {
     serde_json::json!({
         "type": "plc_operation",
-        "rotationKeys": [gen.rotation_did_key],
+        "rotationKeys": rotation_keys,
         "verificationMethods": { "atproto": gen.signing_did_key },
         "alsoKnownAs": [format!("at://{}", gen.handle)],
         "services": { "atproto_pds": { "type": "AtprotoPersonalDataServer", "endpoint": gen.pds_endpoint } },
@@ -427,11 +427,20 @@ pub fn low_s_k256(priv_hex: &str, digest: &[u8; 32]) -> Result<[u8; 64], KeyErro
 }
 
 /// Create + sign a genesis op. Returns (did, signed_op_json).
+/// `rotation_keys` must be non-empty and match the signing `rotation_priv_hex`
+/// (the private half of one of the listed keys).
 pub fn plc_genesis_op(
     rotation_priv_hex: &str,
+    rotation_keys: Vec<String>,
     gen: &PlcGenesis,
 ) -> Result<(String, serde_json::Value), String> {
-    let unsigned = unsigned_genesis(gen);
+    if rotation_keys.is_empty() || rotation_keys.len() > 5 {
+        return Err("rotationKeys must have 1..=5 keys".into());
+    }
+    for k in &rotation_keys {
+        did_key_decode_pub(k).map_err(|e| format!("bad rotationKey: {e}"))?;
+    }
+    let unsigned = unsigned_genesis(&rotation_keys, gen);
     let bytes = unsigned_op_cbor(&unsigned)?;
     if bytes.len() > 7500 {
         return Err("op exceeds 7500 bytes".into());
@@ -480,18 +489,20 @@ mod tests {
 
     const ROT_PRIV: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn genesis_fixture() -> PlcGenesis {
+    fn genesis_fixture() -> (String, PlcGenesis) {
         let rot_pub = keys::k256_pub_from_priv(ROT_PRIV).unwrap();
         let sign_pub = keys::k256_pub_from_priv(
             "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140",
         )
         .unwrap();
-        PlcGenesis {
-            rotation_did_key: did_key_encode(&rot_pub, &Curve::K256).unwrap(),
-            signing_did_key: did_key_encode(&sign_pub, &Curve::K256).unwrap(),
-            handle: "alice.test".into(),
-            pds_endpoint: "https://example.test".into(),
-        }
+        (
+            did_key_encode(&rot_pub, &Curve::K256).unwrap(),
+            PlcGenesis {
+                signing_did_key: did_key_encode(&sign_pub, &Curve::K256).unwrap(),
+                handle: "alice.test".into(),
+                pds_endpoint: "https://example.test".into(),
+            },
+        )
     }
 
     #[test]
@@ -506,8 +517,9 @@ mod tests {
 
     #[test]
     fn genesis_did_is_deterministic_and_well_formed() {
-        let (did1, op1) = plc_genesis_op(ROT_PRIV, &genesis_fixture()).unwrap();
-        let (did2, _) = plc_genesis_op(ROT_PRIV, &genesis_fixture()).unwrap();
+        let (rot, gen) = genesis_fixture();
+        let (did1, op1) = plc_genesis_op(ROT_PRIV, vec![rot.clone()], &gen).unwrap();
+        let (did2, _) = plc_genesis_op(ROT_PRIV, vec![rot], &gen).unwrap();
         assert_eq!(did1, did2);
         assert!(did1.starts_with("did:plc:"));
         assert_eq!(did1.len(), 8 + 24);
@@ -522,7 +534,8 @@ mod tests {
 
     #[test]
     fn genesis_sig_verifies_under_rotation_key() {
-        let (_, op) = plc_genesis_op(ROT_PRIV, &genesis_fixture()).unwrap();
+        let (rot, gen) = genesis_fixture();
+        let (_, op) = plc_genesis_op(ROT_PRIV, vec![rot], &gen).unwrap();
         let mut unsigned = op.clone();
         unsigned.as_object_mut().unwrap().remove("sig");
         let bytes = unsigned_op_cbor(&unsigned).unwrap();
@@ -796,8 +809,8 @@ mod audit_tests {
     fn genesis_op_for(key_priv: &str) -> (String, serde_json::Value) {
         plc_genesis_op(
             key_priv,
+            vec![did_key(key_priv)],
             &PlcGenesis {
-                rotation_did_key: did_key(key_priv),
                 signing_did_key: did_key(key_priv),
                 handle: "audit.test".into(),
                 pds_endpoint: "https://example.test".into(),

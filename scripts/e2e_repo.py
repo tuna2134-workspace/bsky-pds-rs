@@ -94,7 +94,11 @@ class Dec:
             assert tag == 42, f"tag {tag}"
             inner = self.one()
             assert isinstance(inner, tuple) and inner[0] == "bytes"
-            return ("link", inner[1])
+            raw = inner[1]
+            # cbor-tag42: spec form has a 0x00 prefix; accept legacy bare form.
+            if raw[:1] == b"\x00" and len(raw) > 1:
+                raw = raw[1:]
+            return ("link", raw)
         if major == 7:
             if info == 20:
                 return False
@@ -144,7 +148,8 @@ def enc(v):
     if isinstance(v, str):
         return ts(v)
     if isinstance(v, tuple) and v[0] == "link":
-        return head(6, 42) + bs(v[1])
+        # cbor-tag42: null byte prepended to the binary CID.
+        return head(6, 42) + bs(b"\x00" + v[1])
     if isinstance(v, tuple) and v[0] == "bytes":
         return bs(v[1])
     if isinstance(v, list):
@@ -191,72 +196,29 @@ def parse_car(data):
     return roots, blocks
 
 
-# ---------- secp256k1 (from scratch) ----------
-P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
-N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-GX = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
-GY = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+# ---------- secp256k1 (single source: atproto_crypto) ----------
+from atproto_crypto import (
+    K256_P as P,
+    K256_N as N,
+    K256_G as _G,
+    pt_add as _pt_add,
+    pt_mul as _pt_mul,
+    decompress_k256 as decompress,
+    ecdsa_verify,
+    b58dec,
+    B58,
+)
 
+GX, GY = _G
 
+# Legacy two-arg wrappers (module-level P/N kept for compatibility).
 def pt_add(a, b):
-    if a is None:
-        return b
-    if b is None:
-        return a
-    x1, y1 = a
-    x2, y2 = b
-    if x1 == x2 and (y1 + y2) % P == 0:
-        return None
-    if a == b:
-        s = (3 * x1 * x1) * pow(2 * y1, P - 2, P) % P
-    else:
-        s = ((y2 - y1) * pow(x2 - x1, P - 2, P)) % P
-    x3 = (s * s - x1 - x2) % P
-    return (x3, (s * (x1 - x3) - y1) % P)
+    return _pt_add(a, b, P, 0)
 
 
 def pt_mul(k, pt):
-    r = None
-    while k:
-        if k & 1:
-            r = pt_add(r, pt)
-        pt = pt_add(pt, pt)
-        k >>= 1
-    return r
+    return _pt_mul(k, pt, P, 0)
 
-
-def decompress(comp):
-    assert len(comp) == 33 and comp[0] in (2, 3)
-    x = int.from_bytes(comp[1:], "big")
-    y2 = (pow(x, 3, P) + 7) % P
-    y = pow(y2, (P + 1) // 4, P)
-    if (y & 1) != (comp[0] & 1):
-        y = P - y
-    return (x, y)
-
-
-def ecdsa_verify(Q, digest, rs):
-    assert len(digest) == 32 and len(rs) == 64
-    r = int.from_bytes(rs[:32], "big")
-    s = int.from_bytes(rs[32:], "big")
-    assert 1 <= r < N and 1 <= s < N
-    e = int.from_bytes(digest, "big")
-    w = pow(s, N - 2, N)
-    pt = pt_add(pt_mul((e * w) % N, (GX, GY)), pt_mul((r * w) % N, Q))
-    assert pt is not None and pt[0] % N == r, "BAD SIGNATURE"
-    return True
-
-
-B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-
-
-def b58dec(s):
-    n = 0
-    for ch in s:
-        n = n * 58 + B58.index(ch)
-    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
-    pad = len(s) - len(s.lstrip("1"))
-    return b"\x00" * pad + raw
 
 
 def main():

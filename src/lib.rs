@@ -161,3 +161,4 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let (checked, failures) = crate::scheduled::audit_hosted_dids(&env).await;
     worker::console_log!("scheduled audit done: {checked} checked, {failures} failures");
 }
+mod live_regression_tmp;

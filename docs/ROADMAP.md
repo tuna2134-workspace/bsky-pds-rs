@@ -66,6 +66,7 @@
 - [ ] 監査ログの定期的再検証・secret store 移管・残 admin API・メトリクス拡充
 - [x] レート制限 (D1 固定ウィンドウ・429+Retry-After)・SMTP タイムアウト・`/metrics`
 - [x] 配布規律: 非 active の sync/blob 配布停止 (owner 読取は維持)・OAuth atproto-only の読取専用化
+- [x] Lexicon 形状監査: createAccount (recoveryKey/plcOp/didDoc/HandleNotAvailable)・getSession・describeServer
 - [ ] 取下げ/停止/削除のホスティング状態伝播
 
 ## 5. AppView/Relay 連携・運用 (+ 定期監査)

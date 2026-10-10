@@ -71,44 +71,27 @@ class MetaHandler(BaseHTTPRequestHandler):
         pass
 
 
-# ---------- P-256 from scratch ----------
-P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
-A = (P - 3) % P  # P-256 short-Weierstrass coefficient
-N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
-GX = 0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296
-GY = 0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5
-G = (GX, GY)
+# ---------- P-256 (single source: atproto_crypto) ----------
+from atproto_crypto import (
+    P256_P as P,
+    P256_N as N,
+    P256_G as G,
+    P256_A as A,
+    pt_add as _pt_add,
+    pt_mul as _pt_mul,
+    es256_sign_p256,
+    b64u,
+)
+
+GX, GY = G
 
 
 def pt_add(a, b):
-    if a is None:
-        return b
-    if b is None:
-        return a
-    x1, y1 = a
-    x2, y2 = b
-    if x1 == x2 and (y1 + y2) % P == 0:
-        return None
-    if a == b:
-        s = ((3 * x1 * x1 + A) % P) * pow(2 * y1, P - 2, P) % P
-    else:
-        s = ((y2 - y1) * pow(x2 - x1, P - 2, P)) % P
-    x3 = (s * s - x1 - x2) % P
-    return (x3, (s * (x1 - x3) - y1) % P)
+    return _pt_add(a, b, P, A)
 
 
 def pt_mul(k, pt):
-    r = None
-    while k:
-        if k & 1:
-            r = pt_add(r, pt)
-        pt = pt_add(pt, pt)
-        k >>= 1
-    return r
-
-
-def b64u(b):
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    return _pt_mul(k, pt, P, A)
 
 
 priv = int.from_bytes(os.urandom(32), "big") % N
@@ -121,16 +104,7 @@ JKT = b64u(hashlib.sha256(
 
 
 def es256_sign(digest, key=priv):
-    while True:
-        k = int.from_bytes(os.urandom(32), "big") % N or 1
-        R = pt_mul(k, G)
-        r = R[0] % N
-        if r == 0:
-            continue
-        s = (pow(k, N - 2, N) * (int.from_bytes(digest, "big") + r * key)) % N
-        if s == 0:
-            continue
-        return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    return es256_sign_p256(digest, key)
 
 
 def dpop_proof(method, url, nonce=None, ath=None):
