@@ -72,6 +72,9 @@
 
 ## 5. AppView/Relay 連携・運用 (+ 定期監査)
 
+- [x] 本番デプロイ (2026-10-10): https://bsky-pds-rs.tuna2134.workers.dev
+  (D1 bsky-pds + KV + R2 + cron 有効・全 migration 適用・実 PLC 登録で検証)
+
 - [x] PLC 監査の定期再検証 (cron 30 分・`verify_audit_log`・結果は `/metrics` + ログ。改竄しても自動 takedown しない)
 - [x] Secrets Store 評価
 
