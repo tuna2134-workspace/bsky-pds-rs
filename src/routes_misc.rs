@@ -104,10 +104,8 @@ async fn upload_blob(State(s): State<BlobState>, headers: HeaderMap, body: axum:
         return Err(XrpcError::too_large("blob exceeds PDS_BLOB_UPLOAD_LIMIT"));
     }
     let mime = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
-    // CID = sha256-based ref; R2 key is content-addressed.
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(&body);
-    let cid = format!("bafkrei{}", hex::encode(&digest[..16]));
+    // Blob reference CID: raw sha2-256 (`bafkrei…`), content-addressed R2 key.
+    let cid = crate::cid::Cid::raw(&body).to_string();
     let r2_key = format!("{}/{cid}", caller.did);
     let bucket = s.env.bucket("BLOBS").map_err(|e| XrpcError::internal(e.to_string()))?;
     bucket.put(&r2_key, body.to_vec())
@@ -152,7 +150,7 @@ async fn list_blobs(State(s): State<BlobState>, Query(q): Query<BlobListParam>) 
 struct BlobRow {
     cid: String,
     mime: String,
-    size: i64,
+    size: f64,
 }
 
 #[derive(Deserialize)]

@@ -21,17 +21,18 @@
 
 | NSID | 状態 | 備考 |
 |---|---|---|
-| describeRepo | ✅ | DID Doc (PDS service 付)・collections |
-| createRecord / getRecord / putRecord / deleteRecord / listRecords | ✅ | D1 格納・`rev` 採番・firehose 記録 |
+| describeRepo | ✅ | DID Doc (PDS service + `#atproto` Multikey 検証鍵)・collections |
+| createRecord / getRecord / putRecord / deleteRecord / listRecords | ✅ | 実 DAG-CBOR CID・署名 commit・`rev` 採番・firehose CAR slice。`swapCommit`/`swapRecord` 対応 |
 | applyWrites | ✅ (create のみ完全) | update/delete は結果形のみ、次段で完全化 |
-| uploadBlob | ✅ | R2 実体 + D1 インデックス (blob_router) |
+| uploadBlob | ✅ | R2 実体 + D1 インデックス。参照 CID は raw sha2-256 (`bafkrei…`) |
 | listMissingBlobs / importRepo | ⬜ | 移行フローと同時実装 |
 
 ## sync (`com.atproto.sync.*`)
 
 | NSID | 状態 | 備考 |
 |---|---|---|
-| getRepoStatus / listRepos / getRepo / getRecord / getLatestCommit | ✅ | getRepo は JSON 診断 (binary CAR は ROADMAP §1) |
+| getRepoStatus / listRepos / getLatestCommit | ✅ | 実 commit CID・rev |
+| getRepo / getRecord / getBlocks | ✅ | バイナリ CAR (`application/vnd.ipld.car`)。ハッシュ検証付き parse |
 | getBlocks | 🚧 | binary CAR 化待ち |
 | listBlobs / getBlob | ✅ | R2 実体 (blob_router) |
 | subscribeRepos | ✅ (ポーリング互換) | `?cursor=&limit=` で JSON。WS/CBOR は ROADMAP §2 |

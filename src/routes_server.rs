@@ -130,24 +130,23 @@ async fn create_account(
 
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let now = pds_env::now_iso();
-    let rev = atproto::tid::now();
+    // Fresh atproto signing key (secp256k1). Stored alongside the account;
+    // rotation into a secret store is ROADMAP §4.
+    let (priv_hex, pub_hex) = crate::keys::generate_k256().map_err(|e| XrpcError::internal(e.to_string()))?;
     // Minimal account insert; duplicate handle/DID surfaces as 400.
     let insert = db
-        .prepare("INSERT INTO account (did, handle, email, email_confirmed, status, active, created_at, updated_at) VALUES (?1, ?2, ?3, 0, 'active', 1, ?4, ?4)")
-        .bind(&[did.clone().into(), req.handle.clone().into(), req.email.clone().unwrap_or_default().into(), now.clone().into()])
+        .prepare("INSERT INTO account (did, handle, email, email_confirmed, signing_key_k256_priv_hex, signing_key_k256_pub_hex, status, active, created_at, updated_at) VALUES (?1, ?2, ?3, 0, ?4, ?5, 'active', 1, ?6, ?6)")
+        .bind(&[did.clone().into(), req.handle.clone().into(), req.email.clone().unwrap_or_default().into(), priv_hex.into(), pub_hex.into(), now.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run()
         .await;
     if insert.is_err() {
         return Err(XrpcError::bad_request("DuplicateAccount", "handle or DID already exists"));
     }
-    // Empty repo root so sync can serve getRepo immediately.
-    let empty_data = "bafkrei-dev-empty-mst";
-    let commit = crate::car::pseudo_cid_for_json(&format!("{did}:{rev}:genesis"));
-    let _ = db.prepare("INSERT OR IGNORE INTO repo_root (did, rev, data_cid, commit_cid, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)")
-        .bind(&[did.clone().into(), rev.into(), empty_data.into(), commit.into(), now.into()])
-        .map_err(|e| XrpcError::internal(e.to_string()))?
-        .run().await;
+    // Genesis: empty repo, signed commit, #account + #sync firehose events.
+    let out = crate::repo::commit_repo(&s.env, &did, vec![], vec![], None).await?;
+    crate::firehose::emit_account(&s.env, &did, true, None).await?;
+    crate::firehose::emit_sync(&s.env, &did, &out.rev, &out.commit, &out.commit_bytes).await?;
 
     // Compat tokens: unsigned dev JWTs (header.alg=none) so shape matches
     // createSession clients; OAuth DPoP tokens are issued via /oauth/token.

@@ -1,6 +1,6 @@
-//! `com.atproto.repo.*` — record CRUD + blob upload + history.
-//! Full MST commit signing + CAR diffs are staged in (see ROADMAP);
-//! this layer persists canonical record JSON in D1 and bumps `rev`.
+//! `com.atproto.repo.*` — record CRUD + history.
+//! Every mutation funnels through `repo::commit_repo`: real DAG-CBOR CIDs,
+//! rebuilt MST, signed commits, firehose CAR slices.
 
 use axum::{extract::{Query, State}, http::HeaderMap, Json};
 use axum::routing::{get, post};
@@ -8,7 +8,7 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use worker::Env;
 
-use crate::{atproto, auth, car, pds_env, xrpc::{XrpcError, XrpcResult}};
+use crate::{atproto, auth, keys, pds_env, repo, xrpc::{XrpcError, XrpcResult}};
 
 #[derive(Clone)]
 pub struct RepoState {
@@ -23,8 +23,8 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.repo.putRecord", post(put_record))
         .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
         .route("/xrpc/com.atproto.repo.listRecords", get(list_records))
-        .route("/xrpc/com.atproto.repo.applyWrites", post(apply_writes))
         // NOTE: uploadBlob lives in blob_router (R2-backed). Do not re-register here.
+        .route("/xrpc/com.atproto.repo.applyWrites", post(apply_writes))
         .with_state(RepoState { env })
 }
 
@@ -48,10 +48,32 @@ struct DescribeRepoResp {
     handle_is_correct: bool,
 }
 
+/// Shared DID-document builder (PDS service + atproto signing key).
+pub fn did_doc_for(did: &str, handle: &str, pub_hex: Option<&str>, endpoint: &str) -> serde_json::Value {
+    let mut verification = Vec::new();
+    if let Some(pub_hex) = pub_hex {
+        if let Ok(multibase) = keys::multikey_encode(pub_hex, &keys::Curve::K256) {
+            verification.push(serde_json::json!({
+                "id": format!("{did}#atproto"),
+                "type": "Multikey",
+                "controller": did,
+                "publicKeyMultibase": multibase,
+            }));
+        }
+    }
+    serde_json::json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did,
+        "alsoKnownAs": [format!("at://{handle}")],
+        "verificationMethod": verification,
+        "service": [{ "id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": endpoint }],
+    })
+}
+
 #[worker::send]
 async fn describe_repo(State(s): State<RepoState>, Query(q): Query<RepoParam>) -> XrpcResult<Json<DescribeRepoResp>> {
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let row: Option<AcctLite> = db.prepare("SELECT did, handle FROM account WHERE did = ?1 OR handle = ?1")
+    let row: Option<AcctLite> = db.prepare("SELECT did, handle, signing_key_k256_pub_hex AS pub_hex FROM account WHERE did = ?1 OR handle = ?1")
         .bind(&[q.repo.clone().into()]).map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
     let Some(a) = row else { return Err(XrpcError::not_found("RepoNotFound", "repo not found")); };
@@ -61,13 +83,7 @@ async fn describe_repo(State(s): State<RepoState>, Query(q): Query<RepoParam>) -
     Ok(Json(DescribeRepoResp {
         handle: a.handle.clone(),
         did: a.did.clone(),
-        did_doc: serde_json::json!({
-            "@context": ["https://www.w3.org/ns/did/v1"],
-            "id": a.did,
-            "alsoKnownAs": [format!("at://{}", a.handle)],
-            "verificationMethod": [],
-            "service": [{ "id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": endpoint }],
-        }),
+        did_doc: did_doc_for(&a.did, &a.handle, a.pub_hex.as_deref(), &endpoint),
         collections: cols,
         handle_is_correct: true,
     }))
@@ -77,6 +93,7 @@ async fn describe_repo(State(s): State<RepoState>, Query(q): Query<RepoParam>) -
 struct AcctLite {
     did: String,
     handle: String,
+    pub_hex: Option<String>,
 }
 
 #[worker::send]
@@ -144,32 +161,29 @@ async fn create_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
     if record.get("$type").is_none() {
         record["$type"] = serde_json::Value::String(req.collection.clone());
     }
-    write_record(&s.env, &caller.did, &req.collection, &rkey, record).await
-}
-
-#[worker::send]
-async fn write_record(env: &Env, did: &str, collection: &str, rkey: &str, record: serde_json::Value) -> XrpcResult<Json<WriteResp>> {
-    let canonical = serde_json::to_string(&record).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let cid = car::pseudo_cid_for_json(&canonical);
-    let rev = atproto::tid::now();
+    let (canonical, cid, bytes) = repo::canonical_record_cid(&record)?;
     let now = pds_env::now_iso();
-    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let exists: Option<ExistsRow> = db.prepare("SELECT cid AS cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
-        .bind(&[did.into(), collection.into(), rkey.into()]).map_err(|e| XrpcError::internal(e.to_string()))?
+        .bind(&[req.repo.clone().into(), req.collection.clone().into(), rkey.clone().into()]).map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
     if exists.is_some() {
         return Err(XrpcError::bad_request("RecordAlreadyExists", "use putRecord to update"));
     }
-    db.prepare("INSERT INTO record (did, collection, rkey, cid, value_json, rev, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)")
-        .bind(&[did.into(), collection.into(), rkey.into(), cid.clone().into(), canonical.into(), rev.clone().into(), now.clone().into()])
+    db.prepare("INSERT INTO record (did, collection, rkey, cid, value_json, rev, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?6)")
+        .bind(&[req.repo.clone().into(), req.collection.clone().into(), rkey.clone().into(), cid.to_string().into(), canonical.into(), now.into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    bump_rev(env, did, &rev).await?;
-    emit_commit(env, did, &rev, vec![serde_json::json!({"action":"create","path":format!("{collection}/{rkey}"),"cid":cid})]).await?;
+    let ops = vec![serde_json::json!({"action":"create","path":format!("{}/{}", req.collection, rkey),"cid":{ "$link": cid.to_string() }})];
+    let out = repo::commit_repo(&s.env, &req.repo, ops, vec![(cid.clone(), bytes)], req.swap_commit.as_deref()).await?;
+    db.prepare("UPDATE record SET rev = ?1 WHERE did = ?2 AND collection = ?3 AND rkey = ?4")
+        .bind(&[out.rev.clone().into(), req.repo.clone().into(), req.collection.clone().into(), rkey.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
     Ok(Json(WriteResp {
-        uri: format!("at://{did}/{collection}/{rkey}"),
-        cid,
-        commit: serde_json::json!({"cid": car::pseudo_cid_for_json(&format!("{did}:{rev}")), "rev": rev}),
+        uri: format!("at://{}/{}/{}", req.repo, req.collection, rkey),
+        cid: cid.to_string(),
+        commit: serde_json::json!({"cid": out.commit.to_string(), "rev": out.rev}),
     }))
 }
 
@@ -234,6 +248,10 @@ struct PutRecordReq {
     rkey: String,
     #[serde(rename = "record")]
     record: serde_json::Value,
+    #[serde(rename = "swapRecord")]
+    swap_record: Option<String>,
+    #[serde(rename = "swapCommit")]
+    swap_commit: Option<String>,
 }
 
 #[worker::send]
@@ -242,21 +260,36 @@ async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): J
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
-    let canonical = serde_json::to_string(&req.record).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let cid = car::pseudo_cid_for_json(&canonical);
-    let rev = atproto::tid::now();
+    if !atproto::nsid::validate(&req.collection) || !atproto::record_key::validate(&req.rkey) {
+        return Err(XrpcError::bad_request("InvalidRequest", "bad collection or rkey"));
+    }
+    let (canonical, cid, bytes) = repo::canonical_record_cid(&req.record)?;
     let now = pds_env::now_iso();
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    db.prepare("INSERT INTO record (did, collection, rkey, cid, value_json, rev, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) ON CONFLICT(did, collection, rkey) DO UPDATE SET cid = excluded.cid, value_json = excluded.value_json, rev = excluded.rev, updated_at = excluded.updated_at")
-        .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into(), cid.clone().into(), canonical.into(), rev.clone().into(), now.into()])
+    if let Some(expected) = req.swap_record.as_deref() {
+        let cur: Option<ExistsRow> = db.prepare("SELECT cid AS cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+            .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
+        match cur {
+            Some(row) if row.cid == expected => {}
+            _ => return Err(XrpcError::bad_request("InvalidSwap", "swapRecord does not match")),
+        }
+    }
+    db.prepare("INSERT INTO record (did, collection, rkey, cid, value_json, rev, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?6) ON CONFLICT(did, collection, rkey) DO UPDATE SET cid = excluded.cid, value_json = excluded.value_json, updated_at = excluded.updated_at")
+        .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into(), cid.to_string().into(), canonical.into(), now.into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    bump_rev(&s.env, &req.repo, &rev).await?;
-    emit_commit(&s.env, &req.repo, &rev, vec![serde_json::json!({"action":"update","path":format!("{}/{}", req.collection, req.rkey),"cid":cid})]).await?;
+    let ops = vec![serde_json::json!({"action":"update","path":format!("{}/{}", req.collection, req.rkey),"cid":{ "$link": cid.to_string() }})];
+    let out = repo::commit_repo(&s.env, &req.repo, ops, vec![(cid.clone(), bytes)], req.swap_commit.as_deref()).await?;
+    db.prepare("UPDATE record SET rev = ?1 WHERE did = ?2 AND collection = ?3 AND rkey = ?4")
+        .bind(&[out.rev.clone().into(), req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
     Ok(Json(WriteResp {
         uri: format!("at://{}/{}/{}", req.repo, req.collection, req.rkey),
-        cid,
-        commit: serde_json::json!({"cid": car::pseudo_cid_for_json(&format!("{}:{}", req.repo, rev)), "rev": rev}),
+        cid: cid.to_string(),
+        commit: serde_json::json!({"cid": out.commit.to_string(), "rev": out.rev}),
     }))
 }
 
@@ -268,6 +301,10 @@ struct DeleteRecordReq {
     collection: String,
     #[serde(rename = "rkey")]
     rkey: String,
+    #[serde(rename = "swapRecord")]
+    swap_record: Option<String>,
+    #[serde(rename = "swapCommit")]
+    swap_commit: Option<String>,
 }
 
 #[worker::send]
@@ -276,15 +313,24 @@ async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
-    let rev = atproto::tid::now();
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    if let Some(expected) = req.swap_record.as_deref() {
+        let cur: Option<ExistsRow> = db.prepare("SELECT cid AS cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+            .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
+        match cur {
+            Some(row) if row.cid == expected => {}
+            _ => return Err(XrpcError::bad_request("InvalidSwap", "swapRecord does not match")),
+        }
+    }
     db.prepare("DELETE FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
         .bind(&[req.repo.clone().into(), req.collection.clone().into(), req.rkey.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    bump_rev(&s.env, &req.repo, &rev).await?;
-    emit_commit(&s.env, &req.repo, &rev, vec![serde_json::json!({"action":"delete","path":format!("{}/{}", req.collection, req.rkey),"cid":null})]).await?;
-    Ok(Json(serde_json::json!({})))
+    let ops = vec![serde_json::json!({"action":"delete","path":format!("{}/{}", req.collection, req.rkey)})];
+    let out = repo::commit_repo(&s.env, &req.repo, ops, vec![], req.swap_commit.as_deref()).await?;
+    Ok(Json(serde_json::json!({"commit": {"cid": out.commit.to_string(), "rev": out.rev}})))
 }
 
 // --- listRecords ---
@@ -308,7 +354,7 @@ struct ListParam {
 async fn list_records(State(s): State<RepoState>, Query(q): Query<ListParam>) -> XrpcResult<Json<serde_json::Value>> {
     let limit = q.limit.unwrap_or(50).clamp(1, 100);
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    // Cursor = rkey offset (TID-ordered). Full MST range-scan semantics staged in ROADMAP.
+    // Cursor = rkey offset (TID-ordered).
     let rows = if let Some(cur) = q.cursor.clone() {
         db.prepare("SELECT rkey AS k, cid AS c, value_json AS v FROM record WHERE did = ?1 AND collection = ?2 AND rkey > ?3 ORDER BY rkey ASC LIMIT ?4")
             .bind(&[q.repo.clone().into(), q.collection.clone().into(), cur.into(), (limit as f64).into()])
@@ -343,7 +389,7 @@ struct ListRow {
     v: String,
 }
 
-// --- applyWrites ---
+// --- applyWrites (single commit for the whole batch) ---
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -364,52 +410,75 @@ async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req):
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
-    // Validate each write envelope; delegate to the single-write paths above.
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let now = pds_env::now_iso();
+    let mut ops = Vec::new();
+    let mut changed = Vec::new();
     let mut results = Vec::new();
-    for w in req.writes {
+    for w in &req.writes {
         let t = w.get("$type").and_then(|v| v.as_str()).unwrap_or("");
         match t {
             "com.atproto.repo.applyWrites#create" => {
                 let collection = w.get("collection").and_then(|v| v.as_str()).unwrap_or("");
-                let rkey = w.get("rkey").and_then(|v| v.as_str()).map(|s| s.to_string()).unwrap_or_else(atproto::tid::now);
-                let value = w.get("value").cloned().unwrap_or(serde_json::json!({}));
-                let res = write_record(&s.env, &req.repo, collection, &rkey, value).await?;
-                results.push(serde_json::json!({"$type":"com.atproto.repo.applyWrites#createResult","uri":res.uri,"cid":res.cid}));
+                if !atproto::nsid::validate(collection) {
+                    return Err(XrpcError::bad_request("InvalidNsid", "bad collection"));
+                }
+                let rkey = w.get("rkey").and_then(|v| v.as_str()).map(|x| x.to_string()).unwrap_or_else(atproto::tid::now);
+                if !atproto::record_key::validate(&rkey) {
+                    return Err(XrpcError::bad_request("InvalidRecordKey", "bad rkey"));
+                }
+                let mut value = w.get("value").cloned().unwrap_or(serde_json::json!({}));
+                if value.get("$type").is_none() {
+                    value["$type"] = serde_json::Value::String(collection.to_string());
+                }
+                let (canonical, cid, bytes) = repo::canonical_record_cid(&value)?;
+                let exists: Option<ExistsRow> = db.prepare("SELECT cid AS cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+                    .bind(&[req.repo.clone().into(), collection.into(), rkey.clone().into()]).map_err(|e| XrpcError::internal(e.to_string()))?
+                    .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
+                if exists.is_some() {
+                    return Err(XrpcError::bad_request("RecordAlreadyExists", format!("{collection}/{rkey} exists")));
+                }
+                db.prepare("INSERT INTO record (did, collection, rkey, cid, value_json, rev, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?6)")
+                    .bind(&[req.repo.clone().into(), collection.into(), rkey.clone().into(), cid.to_string().into(), canonical.into(), now.clone().into()])
+                    .map_err(|e| XrpcError::internal(e.to_string()))?
+                    .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
+                ops.push(serde_json::json!({"action":"create","path":format!("{collection}/{rkey}"),"cid":{ "$link": cid.to_string() }}));
+                changed.push((cid.clone(), bytes));
+                results.push(serde_json::json!({"$type":"com.atproto.repo.applyWrites#createResult","uri":format!("at://{}/{}/{rkey}", req.repo, collection),"cid":cid.to_string()}));
             }
             "com.atproto.repo.applyWrites#update" => {
-                results.push(serde_json::json!({"$type":"com.atproto.repo.applyWrites#updateResult"}));
+                let collection = w.get("collection").and_then(|v| v.as_str()).unwrap_or("");
+                let rkey = w.get("rkey").and_then(|v| v.as_str()).unwrap_or("");
+                let value = w.get("value").cloned().unwrap_or(serde_json::json!({}));
+                let (canonical, cid, bytes) = repo::canonical_record_cid(&value)?;
+                db.prepare("INSERT INTO record (did, collection, rkey, cid, value_json, rev, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, ?6) ON CONFLICT(did, collection, rkey) DO UPDATE SET cid = excluded.cid, value_json = excluded.value_json, updated_at = excluded.updated_at")
+                    .bind(&[req.repo.clone().into(), collection.into(), rkey.into(), cid.to_string().into(), canonical.into(), now.clone().into()])
+                    .map_err(|e| XrpcError::internal(e.to_string()))?
+                    .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
+                ops.push(serde_json::json!({"action":"update","path":format!("{collection}/{rkey}"),"cid":{ "$link": cid.to_string() }}));
+                changed.push((cid.clone(), bytes));
+                results.push(serde_json::json!({"$type":"com.atproto.repo.applyWrites#updateResult","uri":format!("at://{}/{}/{rkey}", req.repo, collection),"cid":cid.to_string()}));
             }
             "com.atproto.repo.applyWrites#delete" => {
+                let collection = w.get("collection").and_then(|v| v.as_str()).unwrap_or("");
+                let rkey = w.get("rkey").and_then(|v| v.as_str()).unwrap_or("");
+                db.prepare("DELETE FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
+                    .bind(&[req.repo.clone().into(), collection.into(), rkey.into()])
+                    .map_err(|e| XrpcError::internal(e.to_string()))?
+                    .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
+                ops.push(serde_json::json!({"action":"delete","path":format!("{collection}/{rkey}")}));
                 results.push(serde_json::json!({"$type":"com.atproto.repo.applyWrites#deleteResult"}));
             }
             _ => return Err(XrpcError::bad_request("InvalidWrite", format!("unsupported write $type: {t}"))),
         }
     }
-    Ok(Json(serde_json::json!({ "commit": {}, "results": results })))
-}
-
-// --- helpers ---
-
-#[worker::send]
-async fn bump_rev(env: &Env, did: &str, rev: &str) -> XrpcResult<()> {
-    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let now = pds_env::now_iso();
-    db.prepare("INSERT INTO repo_root (did, rev, data_cid, commit_cid, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, updated_at = excluded.updated_at")
-        .bind(&[did.into(), rev.into(), format!("mst:{rev}").into(), car::pseudo_cid_for_json(&format!("{did}:{rev}")).into(), now.into()])
+    let out = repo::commit_repo(&s.env, &req.repo, ops, changed, req.swap_commit.as_deref()).await?;
+    db.prepare("UPDATE record SET rev = ?1 WHERE did = ?2 AND rev = ''")
+        .bind(&[out.rev.clone().into(), req.repo.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    Ok(())
-}
-
-#[worker::send]
-async fn emit_commit(env: &Env, did: &str, rev: &str, ops: Vec<serde_json::Value>) -> XrpcResult<()> {
-    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let seq = pds_env::next_seq(&db).await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    let now = pds_env::now_iso();
-    let payload = serde_json::json!({"$type":"#commit","seq":seq,"repo":did,"rev":rev,"ops":ops,"time":now});
-    db.prepare("INSERT INTO firehose_event (seq, did, kind, rev, payload_json, created_at) VALUES (?1, ?2, 'commit', ?3, ?4, ?5)")
-        .bind(&[(seq as f64).into(), did.into(), rev.into(), payload.to_string().into(), now.into()])
-        .map_err(|e| XrpcError::internal(e.to_string()))?
-        .run().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    Ok(())
+    Ok(Json(serde_json::json!({
+        "commit": {"cid": out.commit.to_string(), "rev": out.rev},
+        "results": results,
+    })))
 }

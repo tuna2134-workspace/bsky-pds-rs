@@ -107,45 +107,76 @@ struct ListRow {
 }
 
 #[worker::send]
-async fn get_repo(State(s): State<SyncState>, Query(q): Query<DidParam>) -> XrpcResult<Json<serde_json::Value>> {
-    // MVP returns a JSON diagnostic; binary CAR (`application/vnd.ipld.car`)
-    // export is staged (see ROADMAP) to keep R2/D1 framing exact.
-    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let root: Option<FullRoot> = db.prepare("SELECT rev, data_cid AS data_cid, commit_cid AS commit_cid FROM repo_root WHERE did = ?1")
-        .bind(&[q.did.clone().into()]).map_err(|e| XrpcError::internal(e.to_string()))?
-        .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    let Some(root) = root else { return Err(XrpcError::not_found("RepoNotFound", "no repo root")); };
-    let recs = db.prepare("SELECT collection, rkey, cid FROM record WHERE did = ?1 ORDER BY collection, rkey")
-        .bind(&[q.did.clone().into()]).map_err(|e| XrpcError::internal(e.to_string()))?
-        .all().await.map_err(|e| XrpcError::internal(e.to_string()))?;
-    let mut paths = Vec::new();
-    for r in recs.results::<RecLite>().unwrap_or_default() {
-        paths.push(format!("{}/{}:{}", r.collection, r.rkey, r.cid));
+async fn get_repo(State(s): State<SyncState>, Query(q): Query<DidParam>) -> XrpcResult<axum::response::Response> {
+    let exp = crate::repo::export_repo(&s.env, &q.did).await?;
+    use axum::response::IntoResponse;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")], exp.car).into_response())
+}
+
+#[derive(Deserialize)]
+struct GetBlocksParam {
+    #[serde(rename = "did")]
+    did: String,
+    #[serde(rename = "cids", deserialize_with = "string_or_seq")]
+    cids: Vec<String>,
+}
+
+/// Accept `?cids=a&cids=b`, a single `?cids=a`, or comma-joined `?cids=a,b`.
+fn string_or_seq<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("string or sequence of strings")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Vec<String>, E> {
+            Ok(vec![v.to_string()])
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
     }
-    Ok(Json(serde_json::json!({
-        "did": q.did, "rev": root.rev, "data": root.data_cid, "commit": root.commit_cid,
-        "paths": paths,
-        "note": "binary CAR export staged; consume listRecords + getRecord until then",
-    })))
-}
-
-#[derive(Deserialize)]
-struct FullRoot {
-    rev: String,
-    data_cid: String,
-    commit_cid: String,
-}
-
-#[derive(Deserialize)]
-struct RecLite {
-    collection: String,
-    rkey: String,
-    cid: String,
+    d.deserialize_any(V)
 }
 
 #[worker::send]
-async fn get_blocks() -> XrpcError {
-    XrpcError::not_implemented("getBlocks binary CAR framing staged (see ROADMAP)")
+async fn get_blocks(State(s): State<SyncState>, Query(q): Query<GetBlocksParam>) -> XrpcResult<axum::response::Response> {
+    // Accept repeated `?cids=` params; also tolerate a single comma-joined value.
+    let mut wanted: Vec<String> = Vec::new();
+    for raw in &q.cids {
+        for part in raw.split(',') {
+            let part = part.trim();
+            if !part.is_empty() {
+                wanted.push(part.to_string());
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Err(XrpcError::bad_request("InvalidRequest", "cids required"));
+    }
+    if wanted.len() > 500 {
+        return Err(XrpcError::bad_request("InvalidRequest", "too many cids"));
+    }
+    let exp = crate::repo::export_repo(&s.env, &q.did).await?;
+    // Re-split commit/MST/record blocks from the full export CAR.
+    let (_, blocks) = crate::mst::parse_car(&exp.car).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let mut out_blocks = Vec::new();
+    for w in &wanted {
+        let Some(found) = blocks.iter().find(|(c, _)| &c.to_string() == w) else {
+            return Err(XrpcError::not_found("BlockNotFound", format!("block not found: {w}")));
+        };
+        out_blocks.push(found.clone());
+    }
+    let car = crate::mst::build_car(&exp.commit, &out_blocks);
+    use axum::response::IntoResponse;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/vnd.ipld.car")], car).into_response())
 }
 
 #[derive(Deserialize)]
@@ -212,8 +243,14 @@ struct EvRow {
 
 #[worker::send]
 async fn get_latest_commit(State(s): State<SyncState>, Query(q): Query<DidParam>) -> XrpcResult<Json<serde_json::Value>> {
+    #[derive(Deserialize)]
+    struct RootLite {
+        rev: String,
+        #[serde(rename = "commit_cid")]
+        commit_cid: String,
+    }
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
-    let root: Option<FullRoot> = db.prepare("SELECT rev, data_cid AS data_cid, commit_cid AS commit_cid FROM repo_root WHERE did = ?1")
+    let root: Option<RootLite> = db.prepare("SELECT rev, commit_cid FROM repo_root WHERE did = ?1")
         .bind(&[q.did.clone().into()]).map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None).await.map_err(|e| XrpcError::internal(e.to_string()))?;
     let Some(r) = root else { return Err(XrpcError::not_found("RepoNotFound", "no repo root")); };

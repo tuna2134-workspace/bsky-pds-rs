@@ -20,12 +20,13 @@
 
 ## 1. Repository 完全性 (Spec: [repository](https://atproto.com/specs/repository))
 
-- [ ] DRISL CBOR エンコーダ + blessed CID (dag-cbor/sha2-256/base32) 生成・検証
-- [ ] MST 実装: 挿入/削除・depth 検証・ノードあたりエントリ上限 (DoS 対策)
-- [ ] 署名付き commit (`sig` over unsigned-commit sha256, k256/p256) と鍵ローテーション時 re-commit
-- [ ] CAR v1 バイナリ export (`getRepo/getBlocks`) と `blocks` 2MB / record 1MB / ops 200 上限制御
-- [ ] diff (CAR slice) + operation-inversion 検証 (test vectors: atproto-interop-tests)
-- [ ] `pseudo_cid_for_json` / `mst:{rev}` プレースホルダの置換 (現状 `dev…` 接頭辞で明示)
+- [x] DRISL CBOR エンコーダ + blessed CID (dag-cbor/sha2-256/base32) 生成・検証 (`src/cbor.rs`, `src/cid.rs`; RFC7049 ベクタ + Python 独立既知値でテスト)
+- [x] MST 実装: 決定論リビルド (挿入順不変)・depth 検証・ノード parse (参照 TS 実装と同形。言語間ルートベクタ一致済み)
+- [x] 署名付き commit (`sig` over unsigned-commit sha256, k256 決定論署名; p256 検証対応) とアカウント作成時鍵生成 + DID Multikey 公開 + 旧行の鍵バックフィル
+- [x] CAR v1 バイナリ export (`getRepo/getBlocks`) と record 1MB 上限制御 (`MAX_RECORD_BYTES`)
+- [ ] diff (CAR slice) + operation-inversion 検証 (test vectors: atproto-interop-tests) — commit イベントは commit+全 MST ノード+変更レコードの slice を搬送 (検証可能)、厳密な最小 diff は次段
+- [x] `pseudo_cid_for_json` / `mst:{rev}` プレースホルダの置換 (旧 `dev…` 行は自己修復で実 CID 化)
+- [ ] MST ノードあたりエントリ上限・CAR streamable 順序・鍵ローテーション時 re-commit
 
 ## 2. Sync / Firehose (Spec: [sync](https://atproto.com/specs/sync), [event-stream](https://atproto.com/specs/event-stream))
 
