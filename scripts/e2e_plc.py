@@ -23,6 +23,7 @@ sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(_
 from e2e_repo import decompress as secp_decompress, ecdsa_verify as secp_verify
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8788"
+TAG = sys.argv[2] if len(sys.argv) > 2 else "plc1"
 ADMIN = base64.b64encode(b"admin:change-me-admin").decode()
 SEEN = {}
 
@@ -129,7 +130,7 @@ class StubPlc(BaseHTTPRequestHandler):
         assert op.get("prev") is None, "genesis prev must be null"
         assert isinstance(op.get("rotationKeys"), list) and len(op["rotationKeys"]) >= 1
         assert "atproto" in op.get("verificationMethods", {}), "atproto key"
-        assert op["alsoKnownAs"] == ["at://alice.example.com"], op["alsoKnownAs"]
+        assert op["alsoKnownAs"] == ["at://%s.example.com" % TAG], op["alsoKnownAs"]
         assert op["services"]["atproto_pds"]["type"] == "AtprotoPersonalDataServer"
         assert len(json.dumps(op).encode()) <= 7500 or True
         unsigned = {k: v for k, v in op.items() if k != "sig"}
@@ -177,7 +178,7 @@ def main():
 
     req = urllib.request.Request(
         BASE + "/xrpc/com.atproto.server.createAccount",
-        data=json.dumps({"handle": "alice.example.com", "email": "alice@example.com",
+        data=json.dumps({"handle": f"{TAG}.example.com", "email": f"{TAG}@example.com",
                          "password": "s3cret-pw-long"}).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Basic " + ADMIN)
@@ -196,7 +197,7 @@ def main():
 
     # resolution through the stub directory
     req2 = urllib.request.Request(
-        BASE + f"/xrpc/com.atproto.identity.resolveHandle?handle=alice.example.com")
+        BASE + f"/xrpc/com.atproto.identity.resolveHandle?handle={TAG}.example.com")
     try:
         with urllib.request.urlopen(req2) as r:
             resolved = json.loads(r.read())

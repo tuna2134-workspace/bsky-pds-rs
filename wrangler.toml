@@ -38,3 +38,6 @@ command = "export CARGO_HOME=\"$PWD/.cargo-home\" CARGO_TARGET_DIR=\"$PWD/.cargo
 
 [observability.logs]
 enabled = true
+
+[triggers]
+crons = ["*/30 * * * *"]

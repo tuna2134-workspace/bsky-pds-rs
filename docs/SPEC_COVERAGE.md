@@ -69,7 +69,8 @@
 | getAccountInfos / searchAccounts | ✅ | 一括・検索 |
 | getSubjectStatus / updateSubjectStatus | ✅ | takedown/停止の伝播 (記録・blob は非破壊秘匿) |
 | sendEmail (admin) | ✅ | 任意送信 |
-| レート制限 (429+Retry-After) / /metrics | ✅ | D1 固定ウィンドウ・集計エンドポイント |
+| レート制限 (429+Retry-After) / /metrics | ✅ | D1 固定ウィンドウ・集計 (+plc_audit) |
+| 定期 PLC 監査 (cron) | ✅ | 監査連鎖の再検証・改竄検知 (自動処置なし) |
 
 ## OAuth (`/.well-known/*`, `/oauth/*`, `/jwks.json`)
 

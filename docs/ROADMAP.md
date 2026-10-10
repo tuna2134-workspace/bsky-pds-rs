@@ -67,7 +67,10 @@
 - [x] レート制限 (D1 固定ウィンドウ・429+Retry-After)・SMTP タイムアウト・`/metrics`
 - [ ] 取下げ/停止/削除のホスティング状態伝播
 
-## 5. AppView/Relay 連携・運用
+## 5. AppView/Relay 連携・運用 (+ 定期監査)
+
+- [x] PLC 監査の定期再検証 (cron 30 分・`verify_audit_log`・結果は `/metrics` + ログ。改竄しても自動 takedown しない)
+- [x] Secrets Store 評価
 
 - [x] メール送信基盤 (`src/email.rs`: SMTP submit・STARTTLS・AUTH LOGIN/PLAIN・log モード)。確認/更新/リセットのトークン論理 + エンドポイント群
 - [x] `listReposByCollection` (resync bootstrap 用コレクション逆引き)

@@ -461,12 +461,14 @@ pub async fn plc_submit(env: &Env, did: &str, op: &serde_json::Value) -> XrpcRes
     req.headers_mut()
         .map(|h| h.set("content-type", "application/json").ok())
         .map_err(|e| XrpcError::internal(e.to_string()))?;
-    let resp = Fetch::Request(req).send().await.map_err(|e| XrpcError::internal(e.to_string()))?;
+    let mut resp = Fetch::Request(req).send().await.map_err(|e| XrpcError::internal(e.to_string()))?;
     if resp.status_code() != 200 {
+        let detail = resp.text().await.unwrap_or_default();
+        let detail = detail.chars().take(300).collect::<String>();
         return Err(XrpcError::new(
             axum::http::StatusCode::BAD_GATEWAY,
             "PlcError",
-            format!("PLC directory rejected operation: {}", resp.status_code()),
+            format!("PLC directory rejected operation ({}): {detail}", resp.status_code()),
         ));
     }
     Ok(did.to_string())
@@ -625,32 +627,34 @@ pub async fn plc_current(env: &Env, did: &str) -> Result<PlcCurrent, String> {
         also_known_as: get_strs(data.get("alsoKnownAs")),
         services: data.get("services").cloned().unwrap_or(serde_json::json!({})),
     };
-    // Audit log -> head CID (accept array-of-entries or single object).
-    let (astatus, atext) = fetch_text(&format!("{base}/{did}/log/audit"), "application/json")
-        .await
-        .map_err(|e| e.message.clone())?;
-    if astatus != 200 {
-        return Err(format!("PLC audit fetch failed: {astatus}"));
-    }
-    let audit: serde_json::Value = serde_json::from_str(&atext).map_err(|e| e.to_string())?;
-    let prev_cid = match &audit {
-        serde_json::Value::Array(entries) => entries
-            .last()
-            .and_then(|e| e.get("cid"))
-            .and_then(|c| c.as_str())
-            .ok_or("audit has no head cid")?
-            .to_string(),
-        serde_json::Value::Object(map) => map
-            .get("cid")
-            .and_then(|c| c.as_str())
-            .ok_or("audit has no cid")?
-            .to_string(),
-        _ => return Err("bad audit shape".into()),
-    };
+    let audit = fetch_audit_log(env, did).await?;
+    let prev_cid = audit
+        .last()
+        .and_then(|e| e.get("cid"))
+        .and_then(|c| c.as_str())
+        .ok_or("audit has no head cid")?
+        .to_string();
     if Cid::parse(&prev_cid).is_err() {
         return Err("bad prev cid".into());
     }
     Ok(PlcCurrent { fields, prev_cid })
+}
+
+/// Fetch the raw PLC audit log (array of `{did,cid,operation}` entries).
+pub async fn fetch_audit_log(env: &Env, did: &str) -> Result<Vec<serde_json::Value>, String> {
+    let cfg = pds_env::PdsEnv::from_env(env).map_err(|e| e.to_string())?;
+    let base = cfg.plc_url.trim_end_matches('/');
+    let (status, text) = fetch_text(&format!("{base}/{did}/log/audit"), "application/json")
+        .await
+        .map_err(|e| e.message.clone())?;
+    if status != 200 {
+        return Err(format!("PLC audit fetch failed: {status}"));
+    }
+    let audit: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    match audit {
+        serde_json::Value::Array(entries) => Ok(entries),
+        _ => Err("audit must be an array".into()),
+    }
 }
 
 use crate::cid::Cid;

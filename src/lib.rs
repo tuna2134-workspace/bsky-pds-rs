@@ -18,6 +18,7 @@ pub mod oauth;
 pub mod pds_env;
 pub mod proxy;
 pub mod ratelimit;
+pub mod scheduled;
 pub mod repo;
 pub mod routes_misc;
 pub mod routes_repo;
@@ -123,6 +124,12 @@ pub async fn metrics(Extension(env): Extension<Env>) -> axum::Json<serde_json::V
         "firehose_seq": -1,
         "oauth_sessions": -1,
     });
+    if let Ok(store) = env.kv("CACHE") {
+        if let Ok(Some(summary)) = store.get("plc:audit:summary").text().await {
+            out["plc_audit"] =
+                serde_json::from_str(&summary).unwrap_or(serde_json::Value::Null);
+        }
+    }
     if let Ok(db) = pds_env::db(&env) {
         out["accounts"] = serde_json::Value::from(count(&db, "SELECT COUNT(*) AS n FROM account").await);
         out["records"] = serde_json::Value::from(count(&db, "SELECT COUNT(*) AS n FROM record").await);
@@ -144,4 +151,13 @@ pub async fn metrics(Extension(env): Extension<Env>) -> axum::Json<serde_json::V
         );
     }
     axum::Json(out)
+}
+
+/// Cron maintenance: PLC audit re-verification (see `scheduled`).
+/// Configure with `[triggers] crons` in wrangler.toml; test locally with
+/// `wrangler dev --test-scheduled` + `POST /__scheduled?cron=*`.
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
+    let (checked, failures) = crate::scheduled::audit_hosted_dids(&env).await;
+    worker::console_log!("scheduled audit done: {checked} checked, {failures} failures");
 }
