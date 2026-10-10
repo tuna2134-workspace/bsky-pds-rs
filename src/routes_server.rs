@@ -124,12 +124,16 @@ async fn create_account(
     headers: HeaderMap,
     Json(req): Json<CreateAccountReq>,
 ) -> XrpcResult<Json<CreateAccountResp>> {
-    crate::ratelimit::check(&s.env, &format!("acct:{}", crate::ratelimit::client_ip(&headers)), 20, 300).await?;
     let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    // Operator provisioning (valid admin token) is exempt from the abuse
+    // bucket; anonymous/public signups are not.
+    let admin_bypass = auth::check_admin(&headers, cfg.admin_password.as_deref()).is_ok();
+    if !admin_bypass {
+        crate::ratelimit::check(&s.env, &format!("acct:{}", crate::ratelimit::client_ip(&headers)), 20, 300).await?;
+    }
     if !atproto::handle::validate(&req.handle) {
         return Err(XrpcError::bad_request("InvalidHandle", "handle syntax invalid"));
     }
-    let admin_bypass = auth::check_admin(&headers, cfg.admin_password.as_deref()).is_ok();
     if cfg.invite_required && req.invite_code.is_none() && !admin_bypass {
         return Err(XrpcError::bad_request("InvalidInviteCode", "invite code required"));
     }
@@ -337,30 +341,46 @@ async fn create_account(
     }))
 }
 
-/// Verify a caller-supplied migration PLC op and submit it for `did`:
-/// recomputes the DID from the signed bytes, requires it to match, checks
-/// the signature against the op's own rotation keys, then submits.
+/// Verify a caller-supplied migration PLC op and submit it for `did`.
+/// Genesis ops (prev null) are self-certifying: the DID recomputes from the
+/// signed bytes and the signature must verify under the op's own rotation
+/// keys. Update ops (prev set) are authorized by the CURRENT rotation keys
+/// with `prev` pinned to the directory head (TOFU-free chaining).
 async fn submit_account_plc_op(env: &worker::Env, did: &str, op: &serde_json::Value) -> XrpcResult<()> {
     if op.get("type").and_then(|v| v.as_str()) != Some("plc_operation") {
         return Err(XrpcError::bad_request("InvalidRequest", "only plc_operation supported here"));
     }
-    let rotation_keys: Vec<String> = op
-        .get("rotationKeys")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|k| k.as_str().map(|s| s.to_string())).collect())
-        .unwrap_or_default();
-    if rotation_keys.is_empty() {
-        return Err(XrpcError::bad_request("InvalidRequest", "rotationKeys required"));
+    let is_genesis = op.get("prev").map(|v| v.is_null()).unwrap_or(true);
+    if is_genesis {
+        let rotation_keys: Vec<String> = op
+            .get("rotationKeys")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|k| k.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        if rotation_keys.is_empty() {
+            return Err(XrpcError::bad_request("InvalidRequest", "rotationKeys required"));
+        }
+        // Recompute the DID from the signed bytes (self-certifying check).
+        let signed_bytes = crate::cbor::encode_json(op).map_err(|e| XrpcError::bad_request("InvalidRequest", e.to_string()))?;
+        let hash = crate::keys::sha256_of(&signed_bytes);
+        let b32 = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &hash).to_lowercase();
+        if did != format!("did:plc:{}", &b32[..24]) {
+            return Err(XrpcError::bad_request("IncompatibleDidDoc", "plcOp does not match the DID"));
+        }
+        crate::identity::verify_plc_op(op, &rotation_keys)
+            .map_err(|e| XrpcError::bad_request("IncompatibleDidDoc", e))?;
+    } else {
+        // Update: pin to the directory head, verify under current keys.
+        let current = crate::identity::plc_current(env, did)
+            .await
+            .map_err(|e| XrpcError::bad_request("UnresolvableDid", e))?;
+        let prev = op.get("prev").and_then(|v| v.as_str()).unwrap_or_default();
+        if prev != current.prev_cid {
+            return Err(XrpcError::bad_request("IncompatibleDidDoc", "plcOp prev is stale"));
+        }
+        crate::identity::verify_plc_op(op, &current.fields.rotation_keys)
+            .map_err(|e| XrpcError::bad_request("IncompatibleDidDoc", e))?;
     }
-    // Recompute the DID from the signed bytes (self-certifying check).
-    let signed_bytes = crate::cbor::encode_json(op).map_err(|e| XrpcError::bad_request("InvalidRequest", e.to_string()))?;
-    let hash = crate::keys::sha256_of(&signed_bytes);
-    let b32 = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &hash).to_lowercase();
-    if did != format!("did:plc:{}", &b32[..24]) {
-        return Err(XrpcError::bad_request("IncompatibleDidDoc", "plcOp does not match the DID"));
-    }
-    crate::identity::verify_plc_op(op, &rotation_keys)
-        .map_err(|e| XrpcError::bad_request("IncompatibleDidDoc", e))?;
     crate::identity::plc_submit(env, did, op).await?;
     Ok(())
 }

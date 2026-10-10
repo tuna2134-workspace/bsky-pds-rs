@@ -481,6 +481,48 @@ def main():
                           "recoveryKey": mig_rot_dk}, auth="Basic " + ADMIN)
     check("plcOp migration import", st == 200 and acct_m.get("did") == op_did,
           str(acct_m)[:120])
+    # plcOp UPDATE path: pre-seed PLC history directly, then migrate with
+    # a prev-pinned update op (exercises head pinning + current-key verify).
+    upd_handle = f"migup-{TAG}.example.com"
+    g_unsigned = {"type": "plc_operation", "rotationKeys": [mig_rot_dk],
+                  "verificationMethods": {"atproto": mig_rot_dk},
+                  "alsoKnownAs": ["at://seed.example.com"],
+                  "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer",
+                                               "endpoint": "https://localhost"}},
+                  "prev": None}
+    g_sig = es256k_sign(_hl.sha256(_enc(g_unsigned)).digest(), mig_priv)
+    g_op = dict(g_unsigned, sig=_b64u(g_sig))
+    g_did = "did:plc:" + __import__("base64").b32encode(
+        _hl.sha256(_enc(g_op)).digest()).decode().lower().rstrip("=")[:24]
+    import urllib.request as _u2
+    _req = _u2.Request(f"http://127.0.0.1:8897/{g_did}",
+                       data=__import__("json").dumps(g_op).encode(), method="POST")
+    with _u2.urlopen(_req) as _r:
+        assert _r.status == 200, "stub PLC genesis seed"
+    with _u2.urlopen(f"http://127.0.0.1:8897/{g_did}/log/audit") as _r:
+        _audit = __import__("json").loads(_r.read())
+    _audit_head = _audit[-1]["cid"]
+    u_unsigned = {"type": "plc_operation", "rotationKeys": [mig_rot_dk],
+                  "verificationMethods": {"atproto": mig_rot_dk},
+                  "alsoKnownAs": [f"at://{upd_handle}"],
+                  "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer",
+                                               "endpoint": "https://localhost"}},
+                  "prev": _audit_head}
+    u_sig = es256k_sign(_hl.sha256(_enc(u_unsigned)).digest(), mig_priv)
+    u_op = dict(u_unsigned, sig=_b64u(u_sig))
+    st, acct_u = call("POST", "/xrpc/com.atproto.server.createAccount",
+                      {"handle": upd_handle, "email": f"migup-{TAG}@example.com",
+                       "password": "s3cret-pw-long", "did": g_did, "plcOp": u_op},
+                      auth="Basic " + ADMIN)
+    check("plcOp update import", st == 200 and acct_u.get("did") == g_did,
+          str(acct_u)[:120])
+    # stale prev rejected
+    st, body = call("POST", "/xrpc/com.atproto.server.createAccount",
+                    {"handle": f"stale-{TAG}.example.com", "email": f"stale-{TAG}@example.com",
+                     "password": "s3cret-pw-long", "did": g_did, "plcOp": u_op},
+                    auth="Basic " + ADMIN)
+    check("stale plcOp prev rejected", st == 400, str(body)[:80])
+
     # duplicate handle now surfaces HandleNotAvailable
     st, body = call("POST", "/xrpc/com.atproto.server.createAccount",
                        {"handle": new_handle, "email": f"dup-{TAG}@example.com",

@@ -246,6 +246,12 @@ pub async fn export_repo(env: &Env, did: &str) -> XrpcResult<RepoExport> {
         return Err(XrpcError::not_found("RepoNotFound", "no repo root"));
     };
     let records = load_records(&db, did).await?;
+    // Memory guard: isolates cannot stream; refuse absurdly large exports
+    // instead of OOMing (256MB of record JSON ≈ millions of records).
+    let record_bytes: usize = records.iter().map(|r| r.value_json.len()).sum();
+    if record_bytes > 256_000_000 {
+        return Err(XrpcError::too_large("repo too large to export in one CAR"));
+    }
     let (entries, changed) = build_entries(&db, did, &records).await?;
     let tree = mst::build(&entries).map_err(|e| XrpcError::internal(e.to_string()))?;
     let priv_hex = signing_key(&db, did).await?;

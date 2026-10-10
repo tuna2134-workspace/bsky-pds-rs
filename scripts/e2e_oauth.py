@@ -269,6 +269,11 @@ def main():
                            auth="DPoP " + access, dpop=proof)
     check("DPoP-authed createRecord", st == 200 and rec["cid"].startswith("bafyrei"), str(rec)[:140])
     RKEY = rec["uri"].rsplit("/", 1)[-1]
+    # PAR single-use: re-approving the same request_uri must fail.
+    st, _, _ = form("/oauth/authorize?format=json",
+                    {"request_uri": par["request_uri"], "handle": HANDLE,
+                     "password": "s3cret-pw-long"})
+    check("PAR reuse rejected", st == 400, f"{st}")
 
     # getSession over OAuth (email hidden without transition:email)
     proof2 = dpop_proof("GET", BASE + "/xrpc/com.atproto.server.getSession", ath=ath)

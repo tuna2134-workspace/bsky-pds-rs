@@ -67,6 +67,7 @@
 - [x] レート制限 (D1 固定ウィンドウ・429+Retry-After)・SMTP タイムアウト・`/metrics`
 - [x] 配布規律: 非 active の sync/blob 配布停止 (owner 読取は維持)・OAuth atproto-only の読取専用化
 - [x] Lexicon 形状監査: createAccount (recoveryKey/plcOp/didDoc/HandleNotAvailable)・getSession・describeServer
+- [x] セキュリティ正確性: PAR 使い捨て (code 行へ文脈複写)・plcOp 更新系 (prev 固定+現行鍵)・import 制限・export 上限・FK カスケード除去
 - [ ] 取下げ/停止/削除のホスティング状態伝播
 
 ## 5. AppView/Relay 連携・運用 (+ 定期監査)

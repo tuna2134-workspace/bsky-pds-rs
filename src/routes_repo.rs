@@ -593,6 +593,10 @@ async fn import_repo(
         // Method+path for DPoP binding: this procedure itself.
         Some(auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.importRepo").await?.did)
     };
+    // 64MB CAR uploads are expensive: hourly per-repo cap on top of auth.
+    if let Some(caller) = caller_did.as_deref() {
+        crate::ratelimit::check(&s.env, &format!("import:{caller}"), 10, 3600).await?;
+    }
     if let Some(caller) = caller_did.as_deref() {
         if caller != commit.did {
             return Err(XrpcError::forbidden("AuthFailed", "can only import your own repo"));

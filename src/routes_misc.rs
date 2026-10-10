@@ -626,8 +626,15 @@ async fn authorize_post(
     let code = crate::keys::random_b64u32().map_err(|e| XrpcError::internal(e.to_string()))?;
     let now = pds_env::now_iso();
     let exp = iso_plus_secs(600);
-    db.prepare("INSERT INTO oauth_code (code, request_uri, did, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)")
-        .bind(&[code.clone().into(), req.request_uri.clone().into(), acct.did.clone().into(), now.into(), exp.into()])
+    db.prepare("INSERT INTO oauth_code (code, request_uri, did, created_at, expires_at, client_id, redirect_uri, scope, code_challenge) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
+        .bind(&[code.clone().into(), req.request_uri.clone().into(), acct.did.clone().into(), now.into(), exp.into(), par.client_id.clone().into(), par.redirect_uri.clone().into(), par.scope.clone().into(), par.code_challenge.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    // PAR request_uris are single-use: one approval mints one code lineage.
+    db.prepare("DELETE FROM oauth_par WHERE request_uri = ?1")
+        .bind(&[req.request_uri.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run()
         .await
@@ -753,9 +760,13 @@ async fn token_inner(
                 did: String,
                 expires_at: String,
                 used_at: Option<String>,
+                client_id: Option<String>,
+                redirect_uri: Option<String>,
+                scope: Option<String>,
+                code_challenge: Option<String>,
             }
             let row: Option<CodeRow> = db
-                .prepare("SELECT request_uri, did, expires_at, used_at FROM oauth_code WHERE code = ?1")
+                .prepare("SELECT request_uri, did, expires_at, used_at, client_id, redirect_uri, scope, code_challenge FROM oauth_code WHERE code = ?1")
                 .bind(&[code.clone().into()])
                 .map_err(|e| XrpcError::internal(e.to_string()))?
                 .first(None)
@@ -767,19 +778,28 @@ async fn token_inner(
             if code_row.used_at.is_some() || expired(&code_row.expires_at) {
                 return Err(ofail("invalid_grant", "code expired or reused"));
             }
-            let par = load_par(env, &code_row.request_uri).await?;
-            if redirect_uri != par.redirect_uri {
+            // PAR context rides on the code row (PARs are single-use, deleted
+            // at approval). Fall back to the live PAR for pre-migration rows.
+            let (par_client_id, par_redirect_uri, par_scope, par_challenge) =
+                match (&code_row.client_id, &code_row.redirect_uri, &code_row.scope, &code_row.code_challenge) {
+                    (Some(c), Some(r), Some(s), Some(ch)) => (c.clone(), r.clone(), s.clone(), ch.clone()),
+                    _ => {
+                        let par = load_par(env, &code_row.request_uri).await?;
+                        (par.client_id, par.redirect_uri, par.scope, par.code_challenge)
+                    }
+                };
+            if redirect_uri != par_redirect_uri {
                 return Err(ofail("invalid_grant", "redirect_uri mismatch"));
             }
             if let Some(cid) = req.client_id.as_deref() {
-                if cid != par.client_id {
-                    return Err(ofail("invalid_grant", "client_id mismatch"));
+                if cid != par_client_id {
+                    return Err(ofail("invalid_client", "client_id mismatch"));
                 }
             }
-            if crate::keys::pkce_s256_challenge(&verifier) != par.code_challenge {
+            if crate::keys::pkce_s256_challenge(&verifier) != par_challenge {
                 return Err(ofail("invalid_grant", "PKCE verification failed"));
             }
-            let meta = crate::oauth::fetch_client_metadata(env, &par.client_id).await?;
+            let meta = crate::oauth::fetch_client_metadata(env, &par_client_id).await?;
             crate::oauth::verify_client_assertion(env, &meta, req.client_assertion.as_deref(), &token_url)
                 .await
                 .map_err(|_| ofail("invalid_client", "bad client assertion"))?;
@@ -790,7 +810,7 @@ async fn token_inner(
                 .run()
                 .await
                 .map_err(|e| XrpcError::internal(e.to_string()))?;
-            let body = issue_session(env, &cfg, &code_row.did, &par.client_id, &par.scope, &dpop.jkt).await?;
+            let body = issue_session(env, &cfg, &code_row.did, &par_client_id, &par_scope, &dpop.jkt).await?;
             Ok(Json(body).into_response())
         }
         Some("refresh_token") => {
