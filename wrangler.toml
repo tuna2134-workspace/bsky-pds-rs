@@ -1,0 +1,40 @@
+name = "bsky-pds-rs"
+main = "build/index.js"
+compatibility_date = "2026-10-10"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+PDS_HOSTNAME = "localhost"
+PDS_DID_PLC_URL = "https://plc.directory"
+PDS_BSKY_APP_VIEW_URL = "https://api.bsky.app"
+PDS_BSKY_APP_VIEW_DID = "did:web:api.bsky.app"
+PDS_REPORT_SERVICE_URL = "https://mod.bsky.app"
+PDS_REPORT_SERVICE_DID = "did:plc:ar7c4by46qjdydhdevvrndac"
+PDS_CRAWLERS = "https://bsky.network"
+PDS_INVITE_REQUIRED = "true"
+PDS_BLOB_UPLOAD_LIMIT = "52428800"
+
+# D1: repo/account metadata, sequencer, sessions, OAuth (PAR/auth codes/tokens)
+[[d1_databases]]
+binding = "DB"
+database_name = "bsky-pds"
+database_id = "local-bsky-pds"
+migrations_dir = "migrations"
+
+# KV: DPoP nonces, OAuth ephemeral, handle/DID resolution cache
+[[kv_namespaces]]
+binding = "CACHE"
+id = "local-cache"
+
+# R2: blob storage (originals). CDN/thumbnail mirroring is out of PDS scope.
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "bsky-pds-blobs"
+
+[build]
+# Keep all Rust/npm caches inside the repo so builds work on machines where
+# $HOME/.cargo and $HOME/.npm are read-only (e.g. sandboxed CI/dev containers).
+command = "export CARGO_HOME=\"$PWD/.cargo-home\" CARGO_TARGET_DIR=\"$PWD/.cargo-target\" XDG_CACHE_HOME=\"$PWD/.xdg-config\" NPM_CONFIG_CACHE=\"$PWD/.npm-cache\" PATH=\"$PWD/.cargo-home/bin:$PATH\" && cargo install -q \"worker-build@^0.8\" && worker-build --release"
+
+[observability.logs]
+enabled = true
