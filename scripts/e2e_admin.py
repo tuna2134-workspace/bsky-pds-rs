@@ -162,6 +162,12 @@ def main():
     st, _, desc = call("GET", f"/xrpc/com.atproto.repo.describeRepo?repo={did}")
     check("new key in doc", st == 200 and desc["didDoc"]["verificationMethod"][0]
           ["publicKeyMultibase"][1:] == res["signingKey"][len("did:key:z"):], "")
+    # Rotation retires the old signing key, so pre-rotation sessions can no
+    # longer verify: re-login, then write under the new key.
+    st, _, sess = call("POST", "/xrpc/com.atproto.server.createSession",
+                       {"identifier": H2, "password": "new-admin-set-pw-long"})
+    check("re-login after rotation", st == 200, "")
+    userauth = "Bearer " + sess["accessJwt"]
     st, _, rec = call("POST", "/xrpc/com.atproto.repo.createRecord",
                       {"repo": did, "collection": "app.bsky.feed.post",
                        "record": {"$type": "app.bsky.feed.post", "text": "after rotation",

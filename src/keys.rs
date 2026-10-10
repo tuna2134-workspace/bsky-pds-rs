@@ -417,6 +417,40 @@ pub fn verify_jwt_es256k(token: &str, pub_hex: &str) -> Result<serde_json::Value
     Ok(payload)
 }
 
+/// Sign access claims with ES256K (account key) and `typ: at+jwt`.
+/// Lets any federation peer verify sessions via the DID doc — unlike HS256
+/// server secrets, which only this PDS can check.
+pub fn sign_access_es256k(priv_hex: &str, claims: &serde_json::Value) -> Result<String, KeyError> {
+    use k256::ecdsa::signature::hazmat::PrehashSigner;
+    let header = serde_json::json!({ "alg": "ES256K", "typ": "at+jwt" });
+    let h = b64u(header.to_string().as_bytes());
+    let p = b64u(claims.to_string().as_bytes());
+    let digest = sha256_of(format!("{h}.{p}").as_bytes());
+    let bytes = hex::decode(priv_hex.trim()).map_err(|_| KeyError::BadEncoding("priv hex".into()))?;
+    let signing = K256Signing::from_bytes(bytes.as_slice().into())
+        .map_err(|_| KeyError::BadEncoding("secret key".into()))?;
+    let (sig, _) = signing.sign_prehash(&digest).map_err(|_| KeyError::BadEncoding("sign failed".into()))?;
+    Ok(format!("{h}.{p}.{}", b64u(&sig.to_bytes())))
+}
+
+/// Peek at a JWT header `alg` without verifying (dispatch only).
+pub fn jwt_alg(token: &str) -> Option<String> {
+    let (header, _, _, _) = jwt_split(token).ok()?;
+    header.get("alg").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// JWT header `typ` without verifying (dispatch only).
+pub fn jwt_typ(token: &str) -> Option<String> {
+    let (header, _, _, _) = jwt_split(token).ok()?;
+    header.get("typ").and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Full JWT split without verifying (resolve-then-verify flows).
+pub fn jwt_split_unverified(token: &str) -> Option<(serde_json::Value, serde_json::Value)> {
+    let (header, payload, _, _) = jwt_split(token).ok()?;
+    Some((header, payload))
+}
+
 /// Sign JWT claims with HS256 (compat session tokens). `typ`: `at+jwt` / `refresh+jwt`.
 pub fn sign_jwt_hs256(secret: &str, typ: &str, claims: &serde_json::Value) -> Result<String, KeyError> {
     use hmac::{Hmac, Mac};

@@ -46,7 +46,9 @@ fn check_claims(payload: &serde_json::Value, hostname: &str, expect_typ: &str) -
     }
     let iss = payload.get("iss").and_then(|v| v.as_str()).unwrap_or("");
     let expect_iss = format!("https://{hostname}");
-    if !iss.is_empty() && iss != expect_iss {
+    // ES256K account tokens are self-issued (iss == sub DID); HS256 server
+    // tokens carry the PDS origin. Anything else is rejected.
+    if !iss.is_empty() && iss != expect_iss && iss != sub {
         return Err(unauth("token issuer mismatch"));
     }
     let _ = expect_typ;
@@ -58,8 +60,10 @@ fn check_claims(payload: &serde_json::Value, hostname: &str, expect_typ: &str) -
 /// - `DPoP <access-jwt>`: OAuth flow. Verifies ES256, expiry, and the DPoP
 ///   proof binding (`htm` = `method`, `htu` = origin + `path`, `ath` over the
 ///   token, `jkt` equals token `cnf.jkt`).
-/// - `Bearer <compat-jwt>`: legacy/App Password flow. Verifies HS256 with
-///   `PDS_JWT_SECRET` and `typ: at+jwt` (refresh tokens are rejected here).
+/// - `Bearer <compat-jwt>`: legacy/App Password flow. Accepts ES256K
+///   account-key sessions (`typ: at+jwt`, `iss` = account DID, verifiable by
+///   any federation peer) and legacy HS256 server-secret sessions during the
+///   transition. Refresh tokens (`refresh+jwt`) are rejected here.
 pub async fn authenticate(env: &Env, headers: &HeaderMap, method: &str, path: &str) -> Result<Caller, XrpcError> {
     let cfg = pds_env::PdsEnv::from_env(env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let auth = headers
@@ -87,6 +91,10 @@ pub async fn authenticate(env: &Env, headers: &HeaderMap, method: &str, path: &s
         return Ok(Caller { did, scope, oauth: true, app_password: false, privileged: false });
     }
     if let Some(token) = auth.strip_prefix("Bearer ") {
+        // Dispatch on alg: ES256K account sessions vs HS256 server sessions.
+        if crate::keys::jwt_alg(token).as_deref() == Some("ES256K") {
+            return authenticate_es256k(env, &cfg, token).await;
+        }
         let secret = cfg
             .jwt_secret
             .ok_or_else(|| XrpcError::unauthorized("compat sessions not configured"))?;
@@ -190,4 +198,51 @@ pub fn require_write_scope(caller: &Caller) -> Result<(), XrpcError> {
         ));
     }
     Ok(())
+}
+
+/// Verify an ES256K account-key session (`typ: at+jwt`, `iss` = account DID).
+/// The signing key resolves from the live DID doc (rotation-safe) with the
+/// stored repo key as fallback. Epoch + app-password semantics match HS256.
+async fn authenticate_es256k(env: &Env, cfg: &pds_env::PdsEnv, token: &str) -> Result<Caller, XrpcError> {
+    let unauth = |m: &str| XrpcError::unauthorized(m);
+    if crate::keys::jwt_typ(token).as_deref() != Some("at+jwt") {
+        return Err(unauth("not an access token"));
+    }
+    let (_, payload) = crate::keys::jwt_split_unverified(token).ok_or_else(|| unauth("bad token shape"))?;
+    let sub = payload.get("sub").and_then(|v| v.as_str()).ok_or_else(|| unauth("token has no sub"))?;
+    if !crate::atproto::did::validate(sub) {
+        return Err(unauth("token sub is not a valid DID"));
+    }
+    // Resolve the verification key: live DID doc first, stored key fallback.
+    let resolved_pub: Option<String> = match crate::identity::resolve_did(env, sub).await {
+        Ok(doc) => doc.signing_key.map(|(_, hex)| hex),
+        Err(_) => None,
+    };
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct KeyEpochRow {
+        signing_key_k256_pub_hex: Option<String>,
+        session_epoch: i64,
+    }
+    let key_row: Option<KeyEpochRow> = db
+        .prepare("SELECT signing_key_k256_pub_hex, session_epoch FROM account WHERE did = ?1")
+        .bind(&[sub.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let (stored_pub, stored_epoch) = match key_row {
+        Some(r) => (r.signing_key_k256_pub_hex, r.session_epoch),
+        None => (None, 0),
+    };
+    let verify_hex = resolved_pub.or(stored_pub).ok_or_else(|| unauth("no verification key"))?;
+    let payload = crate::keys::verify_jwt_es256k(token, &verify_hex).map_err(|_| unauth("bad access token"))?;
+    let (did, scope) = check_claims(&payload, &cfg.hostname, "at+jwt")?;
+    let epoch = payload.get("epoch").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if epoch != stored_epoch {
+        return Err(unauth("session revoked"));
+    }
+    let app_password = payload.get("appPassword").and_then(|v| v.as_bool()).unwrap_or(false);
+    let privileged = payload.get("privileged").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok(Caller { did, scope, oauth: false, app_password, privileged })
 }

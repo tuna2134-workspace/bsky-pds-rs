@@ -15,3 +15,6 @@ build/
 !.dev.vars.example
 __pycache__/
 *.pyc
+docker/bskyapp/out/
+.docker-buildx/
+.docker-config/

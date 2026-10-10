@@ -36,6 +36,7 @@ fn router(env: Env) -> Router {
         .merge(routes_sync::router(env.clone()))
         .merge(routes_misc::identity_router(env.clone()))
         .merge(routes_misc::blob_router(env.clone()))
+        .merge(routes_misc::prefs_router(env.clone()))
         .merge(routes_misc::admin_router(env.clone()))
         .merge(routes_misc::oauth_router(env.clone()))
         .fallback(proxy_fallback)

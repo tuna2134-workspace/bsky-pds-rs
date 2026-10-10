@@ -140,8 +140,27 @@ async fn well_known_did(State(s): State<IdentityState>, headers: HeaderMap) -> X
         if let Some(r) = row {
             return Ok(r.did);
         }
+        return Err(XrpcError::not_found("HandleNotFound", "no account for this host"));
     }
-    Ok(format!("did:web:{}", cfg.hostname))
+    // Apex: the operator's own handle wins when claimed (self-hosted
+    // convention — enables official-client login with zero DNS); otherwise
+    // the host identity did:web.
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(Deserialize)]
+    struct ARow {
+        did: String,
+    }
+    let apex: Option<ARow> = db
+        .prepare("SELECT did FROM account WHERE handle = ?1")
+        .bind(&[cfg.hostname.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    match apex {
+        Some(r) => Ok(r.did),
+        None => Ok(format!("did:web:{}", cfg.hostname)),
+    }
 }
 
 #[worker::send]
@@ -2113,4 +2132,75 @@ mod blob_tests {
         assert!(check_blob_magic("video/mp4", b"anything").is_ok());
         assert!(check_blob_magic("application/octet-stream", b"\x00\x01").is_ok());
     }
+}
+
+// ---------- client preferences (app.bsky.actor.*) ----------
+
+#[derive(Clone)]
+pub struct PrefsState {
+    pub env: Env,
+}
+
+pub fn prefs_router(env: Env) -> Router {
+    Router::new()
+        .route("/xrpc/app.bsky.actor.getPreferences", get(get_preferences))
+        .route("/xrpc/app.bsky.actor.putPreferences", post(put_preferences))
+        .with_state(PrefsState { env })
+}
+
+/// Serve preferences locally: the upstream gateway does not implement this
+/// method, so the PDS keeps each account's opaque preferences itself
+/// (device sync + migration import/export via this same API).
+#[worker::send]
+async fn get_preferences(State(s): State<PrefsState>, headers: HeaderMap) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/app.bsky.actor.getPreferences").await?;
+    crate::repo::require_active(&s.env, &caller.did).await?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(Deserialize)]
+    struct PrefsRow {
+        prefs_json: String,
+    }
+    let row: Option<PrefsRow> = db
+        .prepare("SELECT prefs_json FROM user_prefs WHERE did = ?1")
+        .bind(&[caller.did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    match row {
+        Some(r) => serde_json::from_str(&r.prefs_json).map(Json).map_err(|e| XrpcError::internal(e.to_string())),
+        None => Ok(Json(serde_json::json!({ "preferences": [] }))),
+    }
+}
+
+#[worker::send]
+async fn put_preferences(
+    State(s): State<PrefsState>,
+    headers: HeaderMap,
+    Json(req): Json<serde_json::Value>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/app.bsky.actor.putPreferences").await?;
+    crate::repo::require_active(&s.env, &caller.did).await?;
+    auth::require_write_scope(&caller)?;
+    let prefs = req.get("preferences").and_then(|v| v.as_array()).ok_or_else(|| {
+        XrpcError::bad_request("InvalidRequest", "preferences array required")
+    })?;
+    if prefs.len() > 100 {
+        return Err(XrpcError::bad_request("InvalidRequest", "too many preferences"));
+    }
+    // Store the array verbatim (opaque client data), wrapped in the lexicon shape.
+    let stored = serde_json::json!({ "preferences": prefs });
+    let body = serde_json::to_string(&stored).map_err(|e| XrpcError::internal(e.to_string()))?;
+    if body.len() > 100_000 {
+        return Err(XrpcError::too_large("preferences too large"));
+    }
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let now = pds_env::now_iso();
+    db.prepare("INSERT INTO user_prefs (did, prefs_json, updated_at) VALUES (?1, ?2, ?3) ON CONFLICT(did) DO UPDATE SET prefs_json = excluded.prefs_json, updated_at = excluded.updated_at")
+        .bind(&[caller.did.into(), body.into(), now.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({})))
 }

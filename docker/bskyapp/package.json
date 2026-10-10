@@ -1,0 +1,9 @@
+{
+  "name": "bskyapp-pds-test",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "puppeteer": "^25.0.0"
+  }
+}

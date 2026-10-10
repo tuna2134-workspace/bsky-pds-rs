@@ -10,7 +10,7 @@
 |---|---|---|
 | describeServer | ✅ | +blobUploadLimit |
 | createAccount | ✅ | argon2id・k256 鍵・genesis commit・#account/#sync。`recoveryKey`/`plcOp` 移行対応・didDoc 返却・HandleNotAvailable |
-| createSession / refreshSession / deleteSession | ✅ (互換) | argon2 検証・HS256 ペア (access 1h/refresh 7d)。refresh 回転・epoch 失効 |
+| createSession / refreshSession / deleteSession | ✅ (互換) | argon2 検証・ES256K access (DID発行・連合検証可) + HS256 refresh。refresh 回転・epoch 失効 |
 | getSession | ✅ | didDoc/emailAuthFactor/status。OAuth 時 email は `transition:email` 要求 |
 | createInviteCode(s) / getAccountInviteCodes | ✅ | 管理者発行・単発消費・kill-switch |
 | requestPasswordReset / resetPassword | ✅ | ハッシュ化トークン (1h)・列挙耐性・SMTP/log 配送 |
@@ -86,7 +86,8 @@
 | XRPC エラー標準 | ✅ | `{"error","message"}` + 仕様ステータス |
 | CORS | ✅ (暫定) | `*` 許可。厳密化は本番設定で |
 | `Atproto-Repo-Rev` ヘッダ | ✅ | 全 repo 書き込みに付与 |
-| service proxying (`atproto-proxy`) | ✅ | 転送+ES256K JWT・SSRF ガード |
+| service proxying (`atproto-proxy`) | ✅ | 転送+ES256K JWT (aud はベア DID)・SSRF ガード・ヘッダ伝達・AppView 自動振分 |
+| app.bsky.actor.{get,put}Preferences | ✅ | PDS 側保持 (上流未実装のため) |
 | レート制限 (429+Retry-After) | ✅ | D1 固定ウィンドウ (作成/セッション/OAuth/書込/プロキシ/メール/import) |
 | 定期 PLC 監査 (cron) | ✅ | 監査連鎖の再検証・改竄検知 (自動処置なし) |
 | OAuth リプレイ対策 | ✅ | DPoP/assertion jti (KV 180s)・code 単発・refresh 回転・PAR 単発 |

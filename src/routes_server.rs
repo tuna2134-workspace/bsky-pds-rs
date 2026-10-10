@@ -276,7 +276,7 @@ async fn create_account(
                 Some(e) if !e.trim().is_empty() => e.into(),
                 _ => worker::wasm_bindgen::JsValue::NULL,
             };
-            [did.clone().into(), req.handle.clone().into(), email_js, password_hash.into(), priv_hex.into(), pub_hex.clone().into(), rot_priv_hex.into(), now.clone().into()]
+            [did.clone().into(), req.handle.clone().into(), email_js, password_hash.into(), priv_hex.clone().into(), pub_hex.clone().into(), rot_priv_hex.into(), now.clone().into()]
         })
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run()
@@ -322,7 +322,7 @@ async fn create_account(
     let _ = crate::routes_sync::notify_crawlers(&s.env, &cfg).await;
 
     // Compat tokens: HS256-signed JWTs (OAuth DPoP tokens come from /oauth/token).
-    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &did, 0, None)?;
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &did, 0, None, &priv_hex)?;
 
     Ok(Json(CreateAccountResp {
         did: did.clone(),
@@ -385,20 +385,23 @@ async fn submit_account_plc_op(env: &worker::Env, did: &str, op: &serde_json::Va
     Ok(())
 }
 
-/// Issue a compat session pair (HS256, `PDS_JWT_SECRET`). Access 1h, refresh 7d.
-/// `app_password`: None for primary password, Some(privileged) for app passwords.
+/// Issue a compat session pair. Access is ES256K under the account key
+/// (`iss` = account DID, verifiable by any federation peer via the DID
+/// doc); refresh stays HS256 (`PDS_JWT_SECRET`, only this PDS consumes it).
+/// Access 1h, refresh 7d. `app_password`: None for primary, Some(privileged).
 fn issue_compat_pair(
     env: &worker::Env,
     did: &str,
     epoch: i64,
     app_password: Option<bool>,
+    signing_priv_hex: &str,
 ) -> XrpcResult<(String, String)> {
     let cfg = pds_env::PdsEnv::from_env(env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let secret = cfg.jwt_secret.ok_or_else(|| {
         XrpcError::internal("PDS_JWT_SECRET not configured; compat sessions disabled")
     })?;
     let now = (worker::Date::now().as_millis() / 1000) as i64;
-    let mut access_claims = serde_json::json!({"iss": format!("https://{}", cfg.hostname), "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 3600, "epoch": epoch});
+    let mut access_claims = serde_json::json!({"iss": did, "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 3600, "epoch": epoch});
     let mut refresh_claims = serde_json::json!({"iss": format!("https://{}", cfg.hostname), "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 7 * 86400, "epoch": epoch});
     if let Some(privileged) = app_password {
         access_claims["appPassword"] = serde_json::Value::Bool(true);
@@ -406,7 +409,7 @@ fn issue_compat_pair(
         refresh_claims["appPassword"] = serde_json::Value::Bool(true);
         refresh_claims["privileged"] = serde_json::Value::Bool(privileged);
     }
-    let access = crate::keys::sign_jwt_hs256(&secret, "at+jwt", &access_claims)
+    let access = crate::keys::sign_access_es256k(signing_priv_hex, &access_claims)
         .map_err(|e| XrpcError::internal(e.to_string()))?;
     let refresh = crate::keys::sign_jwt_hs256(&secret, "refresh+jwt", &refresh_claims)
         .map_err(|e| XrpcError::internal(e.to_string()))?;
@@ -451,7 +454,7 @@ async fn create_session_compat(
     crate::ratelimit::check(&s.env, &format!("session:{}", crate::ratelimit::client_ip(&headers)), 60, 60).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
-        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active FROM account WHERE handle = ?1 OR email = ?1 OR did = ?1")
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active, signing_key_k256_priv_hex AS signing_priv FROM account WHERE handle = ?1 OR email = ?1 OR did = ?1")
         .bind(&[req.identifier.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None)
@@ -491,7 +494,7 @@ async fn create_session_compat(
     if a.active == 0 {
         return Err(XrpcError::forbidden("AccountDeactivated", "account is not active"));
     }
-    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did, a.session_epoch, app_password)?;
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did, a.session_epoch, app_password, a.signing_priv.as_deref().unwrap_or_default())?;
     Ok(Json(SessionResp {
         did: a.did.clone(),
         handle: a.handle,
@@ -530,7 +533,7 @@ async fn refresh_session_compat(
     let token_priv = payload.get("privileged").and_then(|v| v.as_bool()).unwrap_or(false);
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
-        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active FROM account WHERE did = ?1")
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active, signing_key_k256_priv_hex AS signing_priv FROM account WHERE did = ?1")
         .bind(&[did.into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None)
@@ -543,7 +546,7 @@ async fn refresh_session_compat(
         return Err(XrpcError::unauthorized("session revoked"));
     }
     let app_password = token_app_pw.then_some(token_priv);
-    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did, a.session_epoch, app_password)?;
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did, a.session_epoch, app_password, a.signing_priv.as_deref().unwrap_or_default())?;
     Ok(Json(SessionResp {
         did: a.did.clone(),
         handle: a.handle,
@@ -585,7 +588,7 @@ async fn get_session(State(s): State<ServerState>, headers: HeaderMap) -> XrpcRe
     let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.server.getSession").await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
-        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active FROM account WHERE did = ?1")
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active, signing_key_k256_priv_hex AS signing_priv FROM account WHERE did = ?1")
         .bind(&[caller.did.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None)
@@ -658,6 +661,8 @@ struct AccountRow {
     password_hash: Option<String>,
     session_epoch: i64,
     active: i64,
+    #[serde(rename = "signing_priv")]
+    signing_priv: Option<String>,
 }
 
 // --- invites ---

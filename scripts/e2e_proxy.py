@@ -180,9 +180,11 @@ def main():
         sig_ok, sig_err = False, str(e)
     check("service JWT signature (user key)", sig_ok, "" if sig_ok else sig_err)
     import time
+    # aud is the BARE service DID (reference verifyJwt compares exact
+    # equality with the service's own DID; the #fragment form is rejected).
     check("service JWT claims",
           claims.get("iss") == did
-          and claims.get("aud") == PROXY_VALUE
+          and claims.get("aud") == STUB_DID
           and claims.get("lxm") == "com.test.view.getData"
           and claims.get("exp", 0) > time.time()
           and claims.get("jti"), str(claims)[:160])

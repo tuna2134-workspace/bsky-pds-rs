@@ -74,6 +74,10 @@
 
 - [x] 本番デプロイ (2026-10-10): https://bsky-pds-rs.tuna2134.workers.dev
   (D1 bsky-pds + KV + R2 + cron 有効・全 migration 適用・実 PLC 登録で検証)
+- [x] 公式クライアント検証 (Docker+Puppeteer): bsky.app でログイン→同意→
+  セッション→設定→年齢確認→ホーム到達。ES256K 互換セッション・bare-aud
+  サービス JWT・プロキシヘッダ伝達・AppView 自動振分・PDS側 preferences・
+  apex well-known 規則の実装を伴う (`docker/bskyapp/README.md`)
 
 - [x] PLC 監査の定期再検証 (cron 30 分・`verify_audit_log`・結果は `/metrics` + ログ。改竄しても自動 takedown しない)
 - [x] Secrets Store 評価

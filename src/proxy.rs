@@ -11,7 +11,9 @@ use worker::Env;
 use crate::{auth, identity, keys, pds_env, repo, xrpc::{XrpcError, XrpcResult}};
 
 /// axum fallback: handles any otherwise-unknown `/xrpc/*` route when the
-/// client asks for proxying. Without the header it is a plain 404.
+/// client asks for proxying. Without the header, well-known AppView/Chat
+/// NSIDs auto-route to the AppView (the official web client omits the header
+/// on some of them); anything else is a plain 404.
 /// Env comes from the router [`Extension`] layer (see `lib.rs`).
 #[worker::send]
 pub async fn proxy_fallback(
@@ -25,10 +27,26 @@ pub async fn proxy_fallback(
     if !path.starts_with("/xrpc/") {
         return Err(XrpcError::not_found("NotFound", "unknown endpoint"));
     }
+    let lxm = path.strip_prefix("/xrpc/").unwrap_or(&path).to_string();
     let proxy = headers
         .get("atproto-proxy")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| crate::xrpc::parse_proxy_header(Some(v)))
+        .or_else(|| {
+            // Compat auto-route: AppView/Chat methods for authed local users.
+            // Locally-served methods (preferences) are handled by their own
+            // routes, which take precedence over this fallback.
+            let local = lxm == "app.bsky.actor.getPreferences" || lxm == "app.bsky.actor.putPreferences";
+            let app_view = !local && (lxm.starts_with("app.bsky.") || lxm.starts_with("chat.bsky."));
+            if app_view {
+                if let Ok(cfg) = pds_env::PdsEnv::from_env(&env) {
+                    if !cfg.appview_url.is_empty() {
+                        return Some((cfg.appview_did.clone(), "bsky_appview".to_string()));
+                    }
+                }
+            }
+            None
+        })
         .ok_or_else(|| XrpcError::not_found("NotFound", "unknown endpoint (hint: atproto-proxy to reach other services)"))?;
     let (service_did, service_id) = proxy;
     let query = uri.query().unwrap_or("").to_string();
@@ -41,7 +59,6 @@ pub async fn proxy_fallback(
     // Resolve the service endpoint; SSRF-guarded.
     let endpoint = identity::resolve_service(&env, &service_did, &service_id).await?;
     guard_endpoint(&env, &endpoint)?;
-    let lxm = path.strip_prefix("/xrpc/").unwrap_or(&path).to_string();
     if !crate::atproto::nsid::validate(&lxm) {
         return Err(XrpcError::bad_request("InvalidNsid", "only NSID endpoints can be proxied"));
     }
@@ -49,7 +66,10 @@ pub async fn proxy_fallback(
         return Err(XrpcError::too_large("proxied body too large"));
     }
 
-    // Inter-service JWT (ES256K, account key, 60s).
+    // Inter-service JWT (ES256K, account key, 60s). `aud` is the BARE
+    // service DID: verifiers compare exact equality against their own DID
+    // (reference `verifyJwt`: `payload.aud !== ownDid` rejects). The
+    // `#service` fragment belongs in the `atproto-proxy` header, not here.
     let db = pds_env::db(&env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let priv_hex = repo::signing_key(&db, &caller.did).await?;
     let now = (worker::Date::now().as_millis() / 1000) as i64;
@@ -58,7 +78,7 @@ pub async fn proxy_fallback(
         &priv_hex,
         &serde_json::json!({
             "iss": caller.did,
-            "aud": format!("{service_did}#{service_id}"),
+            "aud": service_did.clone(),
             "iat": now, "exp": now + 60,
             "lxm": lxm, "jti": jti,
         }),
@@ -71,7 +91,7 @@ pub async fn proxy_fallback(
         target.push('?');
         target.push_str(&query);
     }
-    let out = forward(&http_method, &target, &headers, body, &service_jwt).await?;
+    let out = forward(&http_method, &target, &headers, body, &service_jwt, &service_did, &service_id).await?;
     Ok(out)
 }
 
@@ -118,6 +138,8 @@ async fn forward(
     headers: &HeaderMap,
     body: axum::body::Bytes,
     service_jwt: &str,
+    service_did: &str,
+    service_id: &str,
 ) -> XrpcResult<axum::response::Response> {
     use axum::response::IntoResponse;
     use worker::{Fetch, Method as WMethod, Request, RequestInit};
@@ -147,6 +169,9 @@ async fn forward(
         let _ = hdrs.set("atproto-accept-labelers", labelers);
     }
     let _ = hdrs.set("authorization", &format!("Bearer {service_jwt}"));
+    // Preserve routing info end-to-end: upstreams that gateway by service
+    // (e.g. api.bsky.app) need the original proxy target to dispatch.
+    let _ = hdrs.set("atproto-proxy", &format!("{service_did}#{service_id}"));
     let mut resp = Fetch::Request(req).send().await.map_err(|e| {
         XrpcError::new(axum::http::StatusCode::BAD_GATEWAY, "ProxyError", format!("upstream unreachable: {e}"))
     })?;
