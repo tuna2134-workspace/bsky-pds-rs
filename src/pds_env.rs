@@ -8,6 +8,7 @@ pub struct PdsEnv {
     pub appview_url: String,
     pub appview_did: String,
     pub admin_password: Option<String>,
+    pub jwt_secret: Option<String>,
     pub invite_required: bool,
     pub blob_upload_limit: usize,
 }
@@ -20,6 +21,7 @@ impl PdsEnv {
             appview_url: env.var("PDS_BSKY_APP_VIEW_URL").map(|v| v.to_string()).unwrap_or_else(|_| "https://api.bsky.app".into()),
             appview_did: env.var("PDS_BSKY_APP_VIEW_DID").map(|v| v.to_string()).unwrap_or_else(|_| "did:web:api.bsky.app".into()),
             admin_password: env.var("PDS_ADMIN_PASSWORD").map(|v| v.to_string()).ok(),
+            jwt_secret: env.var("PDS_JWT_SECRET").map(|v| v.to_string()).ok(),
             invite_required: env.var("PDS_INVITE_REQUIRED").map(|v| v.to_string()).unwrap_or_else(|_| "true".into()) == "true",
             blob_upload_limit: env.var("PDS_BLOB_UPLOAD_LIMIT").map(|v| v.to_string()).ok().and_then(|s| s.parse().ok()).unwrap_or(52_428_800),
         })

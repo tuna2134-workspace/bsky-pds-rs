@@ -56,7 +56,7 @@ struct UpdateHandleReq {
 
 #[worker::send]
 async fn update_handle(State(s): State<IdentityState>, headers: HeaderMap, Json(req): Json<UpdateHandleReq>) -> XrpcResult<Json<serde_json::Value>> {
-    let caller = auth::caller_from_headers(&headers)?;
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.identity.updateHandle").await?;
     if !atproto::handle::validate(&req.handle) {
         return Err(XrpcError::bad_request("InvalidHandle", "bad handle"));
     }
@@ -98,7 +98,7 @@ pub fn blob_router(env: Env) -> Router {
 
 #[worker::send]
 async fn upload_blob(State(s): State<BlobState>, headers: HeaderMap, body: axum::body::Bytes) -> XrpcResult<Json<serde_json::Value>> {
-    let caller = auth::caller_from_headers(&headers)?;
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.uploadBlob").await?;
     let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     if body.len() > cfg.blob_upload_limit {
         return Err(XrpcError::too_large("blob exceeds PDS_BLOB_UPLOAD_LIMIT"));
@@ -242,7 +242,7 @@ pub fn oauth_router(env: Env) -> Router {
         .route("/.well-known/did.json", get(did_json))
         .route("/jwks.json", get(jwks))
         .route("/oauth/par", post(par))
-        .route("/oauth/authorize", get(authorize))
+        .route("/oauth/authorize", get(authorize_get).post(authorize_post))
         .route("/oauth/token", post(token))
         .with_state(OAuthState { env })
 }
@@ -251,7 +251,7 @@ pub fn oauth_router(env: Env) -> Router {
 async fn protected_resource(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, invite_required: true, blob_upload_limit: 52_428_800,
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800,
     });
     Json(serde_json::json!({
         "resource": format!("https://{}", cfg.hostname),
@@ -265,7 +265,7 @@ async fn protected_resource(State(s): State<OAuthState>) -> Json<serde_json::Val
 async fn auth_server_meta(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, invite_required: true, blob_upload_limit: 52_428_800,
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800,
     });
     let iss = format!("https://{}", cfg.hostname);
     Json(serde_json::json!({
@@ -287,7 +287,7 @@ async fn auth_server_meta(State(s): State<OAuthState>) -> Json<serde_json::Value
 async fn did_json(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     let cfg = pds_env::PdsEnv::from_env(&s.env).map(|v| v).unwrap_or_else(|_| crate::pds_env::PdsEnv {
         hostname: "localhost".into(), plc_url: "".into(), appview_url: "".into(),
-        appview_did: "".into(), admin_password: None, invite_required: true, blob_upload_limit: 52_428_800,
+        appview_did: "".into(), admin_password: None, jwt_secret: None, invite_required: true, blob_upload_limit: 52_428_800,
     });
     let origin = format!("https://{}", cfg.hostname);
     Json(serde_json::json!({
@@ -300,11 +300,59 @@ async fn did_json(State(s): State<OAuthState>) -> Json<serde_json::Value> {
     }))
 }
 
+// ---------- OAuth server (atproto profile) ----------
+
+fn iso_plus_secs(secs: i64) -> String {
+    // now_iso() is fixed-width RFC3339 UTC; Durations via millis shift are
+    // easier: recompute from epoch millis with the same civil algorithm.
+    // pds_env::now_iso uses Date::now(); replicate offset here.
+    let ms = worker::Date::now().as_millis() as i64 + secs * 1000;
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_ymd(days + 719_468);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60, millis)
+}
+
+fn civil_ymd(z: i64) -> (i64, u32, u32) {
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn expired(expires_at: &str) -> bool {
+    expires_at <= pds_env::now_iso().as_str()
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 #[worker::send]
-async fn jwks() -> Json<serde_json::Value> {
-    // TODO: publish real PDS signing JWKS (ES256K + ES256 rotation). Empty set
-    // forces clients to fail closed until keys are configured — intentional.
-    Json(serde_json::json!({ "keys": [] }))
+async fn jwks(State(s): State<OAuthState>) -> XrpcResult<Json<serde_json::Value>> {
+    let (_, pub_hex) = crate::oauth::oauth_keypair(&s.env).await?;
+    let mut jwk = crate::keys::public_jwk(&pub_hex, &crate::keys::Curve::P256)
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let kid = crate::keys::jwk_thumbprint(&jwk).map_err(|e| XrpcError::internal(e.to_string()))?;
+    jwk["use"] = serde_json::Value::String("sig".into());
+    jwk["alg"] = serde_json::Value::String("ES256".into());
+    jwk["kid"] = serde_json::Value::String(kid);
+    Ok(Json(serde_json::json!({ "keys": [jwk] })))
 }
 
 #[derive(Deserialize)]
@@ -323,6 +371,10 @@ struct ParReq {
     code_challenge_method: Option<String>,
     #[serde(rename = "login_hint")]
     login_hint: Option<String>,
+    #[serde(rename = "client_assertion")]
+    client_assertion: Option<String>,
+    #[serde(rename = "client_assertion_type")]
+    client_assertion_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -334,11 +386,11 @@ struct ParResp {
 }
 
 #[worker::send]
-async fn par(State(s): State<OAuthState>, axum::Form(req): axum::Form<ParReq>) -> XrpcResult<Json<ParResp>> {
-    if !req.client_id.starts_with("https://") && !req.client_id.starts_with("http://localhost") {
-        return Err(XrpcError::bad_request("InvalidClient", "client_id must be https URL (or http://localhost for dev)"));
-    }
+async fn par(State(s): State<OAuthState>, headers: HeaderMap, axum::Form(req): axum::Form<ParReq>) -> XrpcResult<Json<ParResp>> {
     let cc = req.code_challenge.ok_or_else(|| XrpcError::bad_request("InvalidRequest", "PKCE code_challenge required"))?;
+    if cc.len() < 43 || cc.len() > 128 {
+        return Err(XrpcError::bad_request("InvalidRequest", "bad code_challenge"));
+    }
     let ccm = req.code_challenge_method.unwrap_or_else(|| "S256".into());
     if ccm != "S256" {
         return Err(XrpcError::bad_request("InvalidRequest", "only S256 PKCE supported"));
@@ -347,10 +399,29 @@ async fn par(State(s): State<OAuthState>, axum::Form(req): axum::Form<ParReq>) -
     if !scope.split(' ').any(|x| x == "atproto") {
         return Err(XrpcError::bad_request("InvalidScope", "atproto scope required"));
     }
+    // Client metadata: redirect_uri + scope allow-list, confidential auth.
+    let meta = crate::oauth::fetch_client_metadata(&s.env, &req.client_id).await?;
+    if !meta.redirect_uris.iter().any(|r| r == &req.redirect_uri) {
+        return Err(XrpcError::bad_request("InvalidRequest", "redirect_uri not registered"));
+    }
+    let declared: std::collections::HashSet<&str> = meta.scope.split(' ').collect();
+    for sc in scope.split(' ') {
+        if !declared.contains(sc) {
+            return Err(XrpcError::bad_request("InvalidScope", format!("scope not declared: {sc}")));
+        }
+    }
+    if meta.token_endpoint_auth_method == "private_key_jwt" {
+        if req.client_assertion_type.as_deref() != Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer") {
+            return Err(XrpcError::new(axum::http::StatusCode::UNAUTHORIZED, "InvalidClient", "client_assertion required"));
+        }
+        let aud = format!("{}{}", crate::auth::public_origin(&headers, &cfg_hostname(&s.env)), "/oauth/par");
+        crate::oauth::verify_client_assertion(&s.env, &meta, req.client_assertion.as_deref(), &aud).await?;
+    }
     let request_uri = format!("urn:ietf:params:oauth:request_uri:{}", uuid::Uuid::new_v4());
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let now = pds_env::now_iso();
-    db.prepare("INSERT INTO oauth_par (request_uri, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, login_hint, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)")
+    let exp = iso_plus_secs(300);
+    db.prepare("INSERT INTO oauth_par (request_uri, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, login_hint, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)")
         .bind(&[
             request_uri.clone().into(),
             req.client_id.into(),
@@ -360,6 +431,7 @@ async fn par(State(s): State<OAuthState>, axum::Form(req): axum::Form<ParReq>) -
             cc.into(),
             ccm.into(),
             req.login_hint.unwrap_or_default().into(),
+            exp.into(),
             now.into(),
         ])
         .map_err(|e| XrpcError::internal(e.to_string()))?
@@ -367,27 +439,176 @@ async fn par(State(s): State<OAuthState>, axum::Form(req): axum::Form<ParReq>) -
     Ok(Json(ParResp { request_uri, expires_in: 300 }))
 }
 
+fn cfg_hostname(env: &worker::Env) -> String {
+    pds_env::PdsEnv::from_env(env).map(|c| c.hostname).unwrap_or_else(|_| "localhost".into())
+}
+
+#[derive(Deserialize)]
+struct ParRow {
+    client_id: String,
+    redirect_uri: String,
+    scope: String,
+    state: String,
+    code_challenge: String,
+    #[allow(dead_code)]
+    code_challenge_method: String,
+    login_hint: String,
+    expires_at: String,
+}
+
+async fn load_par(env: &worker::Env, request_uri: &str) -> XrpcResult<ParRow> {
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let row: Option<ParRow> = db
+        .prepare("SELECT client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, login_hint, expires_at FROM oauth_par WHERE request_uri = ?1")
+        .bind(&[request_uri.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let Some(par) = row else {
+        return Err(XrpcError::bad_request("InvalidRequest", "unknown request_uri"));
+    };
+    if expired(&par.expires_at) {
+        return Err(XrpcError::bad_request("InvalidRequest", "request_uri expired"));
+    }
+    Ok(par)
+}
+
+// ---------- authorize ----------
+
 #[derive(Deserialize)]
 struct AuthorizeParam {
     #[serde(rename = "request_uri")]
     request_uri: Option<String>,
-    #[serde(rename = "client_id")]
-    client_id: Option<String>,
+    #[serde(rename = "format")]
+    format: Option<String>,
+}
+
+fn wants_json(headers: &HeaderMap, format: Option<&str>) -> bool {
+    if format == Some("json") {
+        return true;
+    }
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("application/json"))
+        .unwrap_or(false)
 }
 
 #[worker::send]
-async fn authorize(State(_s): State<OAuthState>, Query(q): Query<AuthorizeParam>) -> XrpcResult<Json<serde_json::Value>> {
-    // TODO: real login/consent screen (PDS_SERVICE_NAME branding).
-    // Return the pending request so UI work can proceed against a stable shape.
-    if q.request_uri.is_none() {
-        return Err(XrpcError::bad_request("InvalidRequest", "request_uri (PAR) required"));
+async fn authorize_get(
+    State(s): State<OAuthState>,
+    headers: HeaderMap,
+    Query(q): Query<AuthorizeParam>,
+) -> XrpcResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let request_uri = q.request_uri.ok_or_else(|| XrpcError::bad_request("InvalidRequest", "request_uri (PAR) required"))?;
+    let par = load_par(&s.env, &request_uri).await?;
+    if wants_json(&headers, q.format.as_deref()) {
+        return Ok(Json(serde_json::json!({
+            "request_uri": request_uri,
+            "client_id": par.client_id,
+            "scope": par.scope,
+            "login_hint": par.login_hint,
+        }))
+        .into_response());
     }
-    Ok(Json(serde_json::json!({
-        "todo": "render login + consent for client",
-        "request_uri": q.request_uri,
-        "client_id": q.client_id,
-    })))
+    let host = cfg_hostname(&s.env);
+    let page = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize — {host} PDS</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:28rem;margin:4rem auto;padding:0 1rem}}input{{display:block;width:100%;margin:.5rem 0;padding:.6rem}}button{{padding:.6rem 1.2rem}}</style></head>
+<body><h1>{host} PDS</h1><p><b>{client}</b> is requesting access with scope:</p><p><code>{scope}</code></p>
+<form method="post" action="/oauth/authorize"><input type="hidden" name="request_uri" value="{ru}">
+<label>Handle or DID<input name="handle" value="{hint}" autocomplete="username"></label>
+<label>Password or app password<input name="password" type="password" autocomplete="current-password"></label>
+<button type="submit" name="approve" value="true">Authorize</button></form></body></html>"#,
+        host = host,
+        client = par.client_id,
+        scope = par.scope,
+        ru = request_uri,
+        hint = par.login_hint,
+    );
+    Ok(([(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")], page).into_response())
 }
+
+#[derive(Deserialize)]
+struct AuthorizePost {
+    #[serde(rename = "request_uri")]
+    request_uri: String,
+    #[serde(rename = "handle")]
+    handle: String,
+    #[serde(rename = "password")]
+    password: String,
+    #[serde(rename = "format")]
+    format: Option<String>,
+}
+
+#[worker::send]
+async fn authorize_post(
+    State(s): State<OAuthState>,
+    headers: HeaderMap,
+    Query(q): Query<AuthorizeParam>,
+    axum::Form(req): axum::Form<AuthorizePost>,
+) -> XrpcResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let par = load_par(&s.env, &req.request_uri).await?;
+    let format = req.format.as_deref().or(q.format.as_deref());
+    // Authenticate the account (password or app password; both verify here).
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(Deserialize)]
+    struct LoginRow {
+        did: String,
+        handle: String,
+        password_hash: Option<String>,
+        active: i64,
+    }
+    let row: Option<LoginRow> = db
+        .prepare("SELECT did, handle, password_hash, active FROM account WHERE handle = ?1 OR email = ?1 OR did = ?1")
+        .bind(&[req.handle.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let bad = || XrpcError::new(axum::http::StatusCode::UNAUTHORIZED, "AccessDenied", "invalid login");
+    let Some(acct) = row else {
+        return Err(bad());
+    };
+    if acct.active == 0 {
+        return Err(XrpcError::forbidden("AccountDeactivated", "account is not active"));
+    }
+    // login_hint binding: the authorizing account must match the hint.
+    if !par.login_hint.is_empty() && par.login_hint != acct.did && par.login_hint != acct.handle && par.login_hint != req.handle {
+        return Err(bad());
+    }
+    let stored = acct.password_hash.clone().unwrap_or_default();
+    if stored.is_empty() || !crate::oauth::verify_password(&stored, &req.password) {
+        return Err(bad());
+    }
+    // Issue single-use authorization code bound to the PAR + account.
+    let code = crate::keys::random_b64u32().map_err(|e| XrpcError::internal(e.to_string()))?;
+    let now = pds_env::now_iso();
+    let exp = iso_plus_secs(600);
+    db.prepare("INSERT INTO oauth_code (code, request_uri, did, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)")
+        .bind(&[code.clone().into(), req.request_uri.clone().into(), acct.did.clone().into(), now.into(), exp.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let sep = if par.redirect_uri.contains('?') { "&" } else { "?" };
+    let location = format!(
+        "{}{}code={}&state={}",
+        par.redirect_uri,
+        sep,
+        url_encode(&code),
+        url_encode(&par.state)
+    );
+    if wants_json(&headers, format) {
+        return Ok(Json(serde_json::json!({ "redirect_to": location, "code": code, "state": par.state })).into_response());
+    }
+    Ok((axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, location)]).into_response())
+}
+
+// ---------- token ----------
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -400,19 +621,260 @@ struct TokenReq {
     redirect_uri: Option<String>,
     #[serde(rename = "code_verifier")]
     code_verifier: Option<String>,
+    #[serde(rename = "refresh_token")]
+    refresh_token: Option<String>,
+    #[serde(rename = "scope")]
+    scope: Option<String>,
+    #[serde(rename = "client_id")]
+    client_id: Option<String>,
+    #[serde(rename = "client_assertion")]
+    client_assertion: Option<String>,
+    #[serde(rename = "client_assertion_type")]
+    client_assertion_type: Option<String>,
+}
+
+fn oauth_error(status: axum::http::StatusCode, code: &str, desc: &str, dpop_nonce: Option<String>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let mut res = (
+        status,
+        Json(serde_json::json!({ "error": code, "error_description": desc })),
+    )
+        .into_response();
+    if let Some(n) = dpop_nonce {
+        res.headers_mut().insert("DPoP-Nonce", n.parse().unwrap());
+    }
+    res
 }
 
 #[worker::send]
-async fn token(State(_s): State<OAuthState>, headers: HeaderMap, axum::Form(req): axum::Form<TokenReq>) -> XrpcResult<Json<serde_json::Value>> {
-    // DPoP proof is MANDATORY in the atproto profile. Enforce presence here;
-    // full proof/JKT verification is staged (ROADMAP) alongside JWKS publish.
-    if headers.get("DPoP").is_none() {
-        return Err(XrpcError::new(axum::http::StatusCode::BAD_REQUEST, "InvalidDpopProof", "DPoP header required"));
+async fn token(
+    State(s): State<OAuthState>,
+    headers: HeaderMap,
+    axum::Form(req): axum::Form<TokenReq>,
+) -> axum::response::Response {
+    match token_inner(&s.env, &headers, req).await {
+        Ok(res) => res,
+        Err(TokenFail::OAuth(status, code, desc)) => oauth_error(status, &code, &desc, None),
+        Err(TokenFail::Nonce(nonce)) => oauth_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "use_dpop_nonce",
+            "DPoP nonce required",
+            Some(nonce),
+        ),
+        Err(TokenFail::Xrpc(e)) => {
+            use axum::response::IntoResponse;
+            e.into_response()
+        }
     }
-    let _ = req;
-    Err(XrpcError::not_implemented("token issuance staged with DPoP verification + JWKS (see ROADMAP)"))
 }
 
-#[derive(Serialize)]
-#[allow(dead_code)]
-struct Empty {}
+enum TokenFail {
+    OAuth(axum::http::StatusCode, String, String),
+    Nonce(String),
+    Xrpc(XrpcError),
+}
+
+impl From<XrpcError> for TokenFail {
+    fn from(e: XrpcError) -> Self {
+        TokenFail::Xrpc(e)
+    }
+}
+
+fn ofail(code: &str, desc: impl Into<String>) -> TokenFail {
+    TokenFail::OAuth(axum::http::StatusCode::BAD_REQUEST, code.into(), desc.into())
+}
+
+async fn token_inner(
+    env: &worker::Env,
+    headers: &HeaderMap,
+    req: TokenReq,
+) -> Result<axum::response::Response, TokenFail> {
+    use axum::response::IntoResponse;
+    let cfg = pds_env::PdsEnv::from_env(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let token_url = format!("{}{}", crate::auth::public_origin(headers, &cfg.hostname), "/oauth/token");
+    // DPoP is mandatory at the token endpoint (fresh proof + server nonce).
+    let dpop = crate::oauth::verify_dpop(env, headers, "POST", &token_url, None, true)
+        .await
+        .map_err(|e| match e {
+            crate::oauth::DpopError::NonceRequired(n) => TokenFail::Nonce(n),
+            crate::oauth::DpopError::Invalid(m) => ofail("invalid_dpop_proof", m),
+        })?;
+    match req.grant_type.as_deref() {
+        Some("authorization_code") => {
+            let code = req.code.ok_or_else(|| ofail("invalid_request", "code required"))?;
+            let redirect_uri = req.redirect_uri.ok_or_else(|| ofail("invalid_request", "redirect_uri required"))?;
+            let verifier = req.code_verifier.ok_or_else(|| ofail("invalid_request", "code_verifier required"))?;
+            let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+            #[derive(Deserialize)]
+            struct CodeRow {
+                request_uri: String,
+                did: String,
+                expires_at: String,
+                used_at: Option<String>,
+            }
+            let row: Option<CodeRow> = db
+                .prepare("SELECT request_uri, did, expires_at, used_at FROM oauth_code WHERE code = ?1")
+                .bind(&[code.clone().into()])
+                .map_err(|e| XrpcError::internal(e.to_string()))?
+                .first(None)
+                .await
+                .map_err(|e| XrpcError::internal(e.to_string()))?;
+            let Some(code_row) = row else {
+                return Err(ofail("invalid_grant", "bad code"));
+            };
+            if code_row.used_at.is_some() || expired(&code_row.expires_at) {
+                return Err(ofail("invalid_grant", "code expired or reused"));
+            }
+            let par = load_par(env, &code_row.request_uri).await?;
+            if redirect_uri != par.redirect_uri {
+                return Err(ofail("invalid_grant", "redirect_uri mismatch"));
+            }
+            if let Some(cid) = req.client_id.as_deref() {
+                if cid != par.client_id {
+                    return Err(ofail("invalid_grant", "client_id mismatch"));
+                }
+            }
+            if crate::keys::pkce_s256_challenge(&verifier) != par.code_challenge {
+                return Err(ofail("invalid_grant", "PKCE verification failed"));
+            }
+            let meta = crate::oauth::fetch_client_metadata(env, &par.client_id).await?;
+            crate::oauth::verify_client_assertion(env, &meta, req.client_assertion.as_deref(), &token_url)
+                .await
+                .map_err(|_| ofail("invalid_client", "bad client assertion"))?;
+            let now = pds_env::now_iso();
+            db.prepare("UPDATE oauth_code SET used_at = ?1 WHERE code = ?2")
+                .bind(&[now.into(), code.into()])
+                .map_err(|e| XrpcError::internal(e.to_string()))?
+                .run()
+                .await
+                .map_err(|e| XrpcError::internal(e.to_string()))?;
+            let body = issue_session(env, &cfg, &code_row.did, &par.client_id, &par.scope, &dpop.jkt).await?;
+            Ok(Json(body).into_response())
+        }
+        Some("refresh_token") => {
+            let refresh = req.refresh_token.ok_or_else(|| ofail("invalid_request", "refresh_token required"))?;
+            let (_, server_pub) = crate::oauth::oauth_keypair(env).await?;
+            let payload = crate::keys::verify_jwt_es256(&refresh, &server_pub, Some("refresh+jwt"))
+                .map_err(|_| ofail("invalid_grant", "bad refresh token"))?;
+            let did = payload.get("sub").and_then(|v| v.as_str()).ok_or_else(|| ofail("invalid_grant", "bad sub"))?;
+            let exp = payload.get("exp").and_then(|v| v.as_i64()).unwrap_or(0);
+            if (worker::Date::now().as_millis() / 1000) as i64 > exp + 30 {
+                return Err(ofail("invalid_grant", "refresh token expired"));
+            }
+            let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+            #[derive(Deserialize)]
+            struct SessRow {
+                jti: String,
+                did: String,
+                client_id: String,
+                scope: String,
+                dpop_jkt: String,
+                expires_at: String,
+            }
+            let row: Option<SessRow> = db
+                .prepare("SELECT jti, did, client_id, scope, dpop_jkt, expires_at FROM oauth_token WHERE refresh_token_hash = ?1")
+                .bind(&[crate::keys::sha256_hex(&refresh).into()])
+                .map_err(|e| XrpcError::internal(e.to_string()))?
+                .first(None)
+                .await
+                .map_err(|e| XrpcError::internal(e.to_string()))?;
+            let Some(sess) = row else {
+                return Err(ofail("invalid_grant", "unknown session (rotated or revoked)"));
+            };
+            if sess.did != did || expired(&sess.expires_at) {
+                return Err(ofail("invalid_grant", "session expired"));
+            }
+            if dpop.jkt != sess.dpop_jkt {
+                return Err(ofail("invalid_grant", "DPoP key changed"));
+            }
+            if let Some(cid) = req.client_id.as_deref() {
+                if cid != sess.client_id {
+                    return Err(ofail("invalid_client", "client_id mismatch"));
+                }
+            }
+            // Optional down-scoping.
+            let scope = match req.scope {
+                Some(want) => {
+                    let granted: std::collections::HashSet<&str> = sess.scope.split(' ').collect();
+                    for sc in want.split(' ') {
+                        if !granted.contains(sc) {
+                            return Err(ofail("invalid_scope", format!("scope not granted: {sc}")));
+                        }
+                    }
+                    if !want.split(' ').any(|x| x == "atproto") {
+                        return Err(ofail("invalid_scope", "atproto scope required"));
+                    }
+                    want
+                }
+                None => sess.scope.clone(),
+            };
+            // Rotate: drop the old session row, issue fresh tokens.
+            db.prepare("DELETE FROM oauth_token WHERE jti = ?1")
+                .bind(&[sess.jti.clone().into()])
+                .map_err(|e| XrpcError::internal(e.to_string()))?
+                .run()
+                .await
+                .map_err(|e| XrpcError::internal(e.to_string()))?;
+            let body = issue_session(env, &cfg, &sess.did, &sess.client_id, &scope, &dpop.jkt).await?;
+            Ok(Json(body).into_response())
+        }
+        _ => Err(ofail("unsupported_grant_type", "grant_type must be authorization_code or refresh_token")),
+    }
+}
+
+/// Mint + persist an OAuth session (access 2h, refresh 30d, both DPoP-bound).
+async fn issue_session(
+    env: &worker::Env,
+    cfg: &pds_env::PdsEnv,
+    did: &str,
+    client_id: &str,
+    scope: &str,
+    jkt: &str,
+) -> XrpcResult<serde_json::Value> {
+    let (priv_hex, _) = crate::oauth::oauth_keypair(env).await?;
+    let iss = format!("https://{}", cfg.hostname);
+    let now = (worker::Date::now().as_millis() / 1000) as i64;
+    let access_jti = crate::keys::random_b64u32().map_err(|e| XrpcError::internal(e.to_string()))?;
+    let refresh_jti = crate::keys::random_b64u32().map_err(|e| XrpcError::internal(e.to_string()))?;
+    let access_exp = now + 7200;
+    let refresh_exp = now + 30 * 86400;
+    let access = crate::keys::sign_jwt_es256(
+        &priv_hex,
+        "at+jwt",
+        &serde_json::json!({"iss": iss, "sub": did, "scope": scope, "iat": now, "exp": access_exp, "jti": access_jti, "cnf": {"jkt": jkt}, "client_id": client_id}),
+    )
+    .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let refresh = crate::keys::sign_jwt_es256(
+        &priv_hex,
+        "refresh+jwt",
+        &serde_json::json!({"iss": iss, "sub": did, "scope": scope, "iat": now, "exp": refresh_exp, "jti": refresh_jti, "cnf": {"jkt": jkt}, "client_id": client_id}),
+    )
+    .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let db = pds_env::db(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let created = pds_env::now_iso();
+    let exp_iso = iso_plus_secs(30 * 86400);
+    db.prepare("INSERT INTO oauth_token (jti, did, client_id, scope, dpop_jkt, access_token_hash, refresh_token_hash, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")
+        .bind(&[
+            refresh_jti.into(),
+            did.into(),
+            client_id.into(),
+            scope.into(),
+            jkt.into(),
+            crate::keys::sha256_hex(&access).into(),
+            crate::keys::sha256_hex(&refresh).into(),
+            exp_iso.into(),
+            created.into(),
+        ])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok(serde_json::json!({
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "DPoP",
+        "expires_in": 7200,
+        "scope": scope,
+        "sub": did,
+    }))
+}

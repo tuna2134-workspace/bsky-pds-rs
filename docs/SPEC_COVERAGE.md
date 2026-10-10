@@ -9,7 +9,9 @@
 |---|---|---|
 | describeServer | ✅ | ドメイン/招待要否を返す |
 | createAccount | ✅ | D1 登録・空 repo 初期化・互換 JWT 返却 |
-| createSession / refreshSession / getSession | ✅ (互換) | Bearer 移行期。OAuth へ移行予定 |
+| createAccount | ✅ | argon2id ハッシュ保存・k256 署名鍵生成・genesis 署名 commit・#account/#sync 発火。handle/email UNIQUE |
+| createSession / refreshSession | ✅ (互換) | argon2 検証・HS256 署名ペア (access 1h/refresh 7d)。refresh は回転 |
+| getSession | ✅ | Lexicon 形 (トークンなし)。OAuth 時 email は `transition:email` 要求 |
 | createInviteCode(s) | ✅ | 管理者トークン必須 |
 | requestPasswordReset / resetPassword | 🚧 | SMTP 配線と同時実装 |
 | checkAccountStatus | 🚧 | |
@@ -59,10 +61,11 @@
 | 経路 | 状態 | 備考 |
 |---|---|---|
 | oauth-protected-resource / oauth-authorization-server | ✅ | |
-| `/.well-known/did.json` / `/jwks.json` | ✅ | JWKS は空で fail-closed |
-| POST /oauth/par | ✅ | PKCE S256・atproto スコープ強制 |
-| GET /oauth/authorize | 🚧 | 同意画面スタブ (JSON で保留中要求を返す) |
-| POST /oauth/token | 🚧 | DPoP 必須を強制、発行は ROADMAP §3 |
+| `/.well-known/did.json` / `/jwks.json` | ✅ | JWKS は実 ES256 鍵 (kid=jkt) |
+| POST /oauth/par | ✅ | PKCE S256・atproto スコープ強制・client メタデータ検証 (redirect/scope)・confidential アサーション |
+| GET /oauth/authorize | ✅ | HTML ログイン+同意画面 / JSON 保留表示 |
+| POST /oauth/authorize | ✅ | パスワード認証・login_hint 束縛・単発 code 発行 (302 / JSON) |
+| POST /oauth/token | ✅ | authorization_code + refresh_token (回転・失効)。DPoP+nonce 必須・PKCE・client 検証。OAuth 形式エラー + `use_dpop_nonce` |
 
 ## その他
 

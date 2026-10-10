@@ -10,6 +10,7 @@ pub mod cid;
 pub mod firehose;
 pub mod keys;
 pub mod mst;
+pub mod oauth;
 pub mod pds_env;
 pub mod repo;
 pub mod routes_misc;

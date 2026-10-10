@@ -146,7 +146,7 @@ struct WriteResp {
 
 #[worker::send]
 async fn create_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<CreateRecordReq>) -> XrpcResult<Json<WriteResp>> {
-    let caller = auth::caller_from_headers(&headers)?;
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.createRecord").await?;
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
@@ -256,7 +256,7 @@ struct PutRecordReq {
 
 #[worker::send]
 async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<PutRecordReq>) -> XrpcResult<Json<WriteResp>> {
-    let caller = auth::caller_from_headers(&headers)?;
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.putRecord").await?;
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
@@ -309,7 +309,7 @@ struct DeleteRecordReq {
 
 #[worker::send]
 async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<DeleteRecordReq>) -> XrpcResult<Json<serde_json::Value>> {
-    let caller = auth::caller_from_headers(&headers)?;
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.deleteRecord").await?;
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
@@ -406,7 +406,7 @@ struct ApplyWritesReq {
 
 #[worker::send]
 async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req): Json<ApplyWritesReq>) -> XrpcResult<Json<serde_json::Value>> {
-    let caller = auth::caller_from_headers(&headers)?;
+    let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.applyWrites").await?;
     if caller.did != req.repo {
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }

@@ -37,14 +37,18 @@
 
 ## 3. OAuth 完成 (Spec: [oauth](https://atproto.com/specs/oauth))
 
-- [ ] DPoP proof 検証 + `jkt` バインド・サーバ発行 nonce (KV)
-- [ ] `/oauth/token`: authorization_code → access/refresh 発行 (`sub`=DID, `scope` 必須返却)
-- [ ] refresh_token ローテーション・失効、機密クライアント `private_key_jwt` (ES256)
-- [ ] `jwks.json` 実鍵公開 (ES256K + ES256、ローテーション運用)
-- [ ] client metadata 取得・検証・キャッシュ (SSRF 対策の hardened fetch)
-- [ ] 認可 UI (PDS_SERVICE_NAME ブランディング・scope 表示・trusted client 表示制御)
+- [x] DPoP proof 検証 (ES256・htm/htu/iat/jti/ath) + `jkt` バインド・サーバ発行 nonce (KV 単発) — `scripts/e2e_oauth.py` でループ検証
+- [x] `/oauth/token`: authorization_code → access/refresh 発行 (`sub`=DID, `scope`・`token_type: DPoP` 返却)、PKCE 照合・redirect 照合・PAR 有効期限・code 単発
+- [x] refresh_token ローテーション・失効 (使用済み refresh は `invalid_grant`)
+- [x] 機密クライアント `private_key_jwt` (ES256) 検証 (jwks/jwks_uri)
+- [x] `jwks.json` 実鍵公開 (ES256 サーバ鍵、D1 永続・初回生成)
+- [x] client metadata 取得・検証・キャッシュ (https 強制・loopback 例外・32KB 上限・KV 1h)
+- [x] 認可 UI (HTML ログイン+同意画面。PDS_SERVICE_NAME ブランディングは任意項目として残存)
+- [x] 互換セッションの署名化 (HS256 + `PDS_JWT_SECRET`)・argon2id パスワード検証・`getSession` の Lexicon 形修正・OAuth 時の email 非表示 (`transition:email` のみ)
+- [x] handle/email の UNIQUE 制約 (migration 0003; email 未設定は NULL)
 - [ ] `transition:*` スコープの段階廃止計画
 - [ ] 互換セッション (password) の無効化フラグ (OAuth のみ運用へ)
+- [ ] ES256K DPoP/JWKS・鍵ローテーション運用・trusted client 表示制御
 
 ## 4. Identity / 連合 (Specs: [did](https://atproto.com/specs/did), [handle](https://atproto.com/specs/handle), [account](https://atproto.com/specs/account))
 

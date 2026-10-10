@@ -19,7 +19,7 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.server.describeServer", get(describe_server))
         .route("/xrpc/com.atproto.server.createAccount", post(create_account))
         .route("/xrpc/com.atproto.server.createSession", post(create_session_compat))
-        .route("/xrpc/com.atproto.server.refreshSession", post(refresh_session_compat))
+        .route("/xrpc/com.atproto.server.refreshSession", post(refresh_session_post))
         .route("/xrpc/com.atproto.server.getSession", get(get_session))
         .route("/xrpc/com.atproto.server.createInviteCode", post(create_invite_code))
         .route("/xrpc/com.atproto.server.createInviteCodes", post(create_invite_codes))
@@ -110,11 +110,11 @@ async fn create_account(
             return Err(XrpcError::bad_request("InvalidInviteCode", "invite code required"));
         }
     }
-    if req.password.is_none() {
+    let password = req.password.ok_or_else(|| {
         // OAuth-primary PDS still accepts password for compat/App Passwords.
-        // Require *something* so legacy createSession keeps working.
-        return Err(XrpcError::bad_request("InvalidPassword", "password required for compat session"));
-    }
+        XrpcError::bad_request("InvalidPassword", "password required for compat session")
+    })?;
+    let password_hash = crate::oauth::hash_password(&password)?;
 
     // DID: accept caller-provided did:plc (migration/reservation) else mint placeholder.
     // Full PLC directory registration happens out-of-band; doc updated on activation.
@@ -135,8 +135,14 @@ async fn create_account(
     let (priv_hex, pub_hex) = crate::keys::generate_k256().map_err(|e| XrpcError::internal(e.to_string()))?;
     // Minimal account insert; duplicate handle/DID surfaces as 400.
     let insert = db
-        .prepare("INSERT INTO account (did, handle, email, email_confirmed, signing_key_k256_priv_hex, signing_key_k256_pub_hex, status, active, created_at, updated_at) VALUES (?1, ?2, ?3, 0, ?4, ?5, 'active', 1, ?6, ?6)")
-        .bind(&[did.clone().into(), req.handle.clone().into(), req.email.clone().unwrap_or_default().into(), priv_hex.into(), pub_hex.into(), now.clone().into()])
+        .prepare("INSERT INTO account (did, handle, email, email_confirmed, password_hash, signing_key_k256_priv_hex, signing_key_k256_pub_hex, status, active, created_at, updated_at) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, 'active', 1, ?7, ?7)")
+        .bind(&{
+            let email_js: worker::wasm_bindgen::JsValue = match req.email.clone() {
+                Some(e) if !e.trim().is_empty() => e.into(),
+                _ => worker::wasm_bindgen::JsValue::NULL,
+            };
+            [did.clone().into(), req.handle.clone().into(), email_js, password_hash.into(), priv_hex.into(), pub_hex.into(), now.clone().into()]
+        })
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .run()
         .await;
@@ -148,10 +154,8 @@ async fn create_account(
     crate::firehose::emit_account(&s.env, &did, true, None).await?;
     crate::firehose::emit_sync(&s.env, &did, &out.rev, &out.commit, &out.commit_bytes).await?;
 
-    // Compat tokens: unsigned dev JWTs (header.alg=none) so shape matches
-    // createSession clients; OAuth DPoP tokens are issued via /oauth/token.
-    let access_jwt = dev_jwt(&did, "at+jwt");
-    let refresh_jwt = dev_jwt(&did, "refresh+jwt");
+    // Compat tokens: HS256-signed JWTs (OAuth DPoP tokens come from /oauth/token).
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &did)?;
 
     Ok(Json(CreateAccountResp {
         did: did.clone(),
@@ -164,12 +168,26 @@ async fn create_account(
     }))
 }
 
-fn dev_jwt(did: &str, typ: &str) -> String {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64U;
-    use base64::Engine;
-    let h = B64U.encode(serde_json::json!({"alg":"none","typ":typ}).to_string());
-    let p = B64U.encode(serde_json::json!({"sub":did,"iat":0,"exp":9999999999i64,"scope":"transition:generic"}).to_string());
-    format!("{h}.{p}.")
+/// Issue a compat session pair (HS256, `PDS_JWT_SECRET`). Access 1h, refresh 7d.
+fn issue_compat_pair(env: &worker::Env, did: &str) -> XrpcResult<(String, String)> {
+    let cfg = pds_env::PdsEnv::from_env(env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let secret = cfg.jwt_secret.ok_or_else(|| {
+        XrpcError::internal("PDS_JWT_SECRET not configured; compat sessions disabled")
+    })?;
+    let now = (worker::Date::now().as_millis() / 1000) as i64;
+    let access = crate::keys::sign_jwt_hs256(
+        &secret,
+        "at+jwt",
+        &serde_json::json!({"iss": format!("https://{}", cfg.hostname), "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 3600}),
+    )
+    .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let refresh = crate::keys::sign_jwt_hs256(
+        &secret,
+        "refresh+jwt",
+        &serde_json::json!({"iss": format!("https://{}", cfg.hostname), "sub": did, "scope": "transition:generic", "iat": now, "exp": now + 7 * 86400}),
+    )
+    .map_err(|e| XrpcError::internal(e.to_string()))?;
+    Ok((access, refresh))
 }
 
 // --- compat session (legacy) ---
@@ -206,38 +224,108 @@ async fn create_session_compat(
     State(s): State<ServerState>,
     Json(req): Json<CreateSessionReq>,
 ) -> XrpcResult<Json<SessionResp>> {
-    let _ = req.password; // TODO: picks up password_hash verification (argon2) — compat only
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
-        .prepare("SELECT did, handle, email, email_confirmed, active FROM account WHERE handle = ?1 OR email = ?1 OR did = ?1")
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, active FROM account WHERE handle = ?1 OR email = ?1 OR did = ?1")
         .bind(&[req.identifier.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None)
         .await
         .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let bad = || XrpcError::new(axum::http::StatusCode::UNAUTHORIZED, "AuthenticationRequired", "invalid identifier or password");
     let Some(a) = row else {
-        return Err(XrpcError::new(axum::http::StatusCode::UNAUTHORIZED, "AuthenticationRequired", "invalid identifier or password"));
+        return Err(bad());
     };
+    let stored = a.password_hash.clone().unwrap_or_default();
+    if stored.is_empty() || !crate::oauth::verify_password(&stored, &req.password) {
+        return Err(bad());
+    }
     if a.active == 0 {
         return Err(XrpcError::forbidden("AccountDeactivated", "account is not active"));
     }
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did)?;
     Ok(Json(SessionResp {
         did: a.did.clone(),
         handle: a.handle,
         email: a.email,
         email_confirmed: a.email_confirmed == 1,
-        access_jwt: dev_jwt(&a.did, "at+jwt"),
-        refresh_jwt: dev_jwt(&a.did, "refresh+jwt"),
+        access_jwt,
+        refresh_jwt,
         active: a.active == 1,
     }))
 }
 
 #[worker::send]
-async fn refresh_session_compat(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<SessionResp>> {
-    let caller = auth::caller_from_headers(&headers)?;
+async fn refresh_session_compat(
+    State(s): State<ServerState>,
+    headers: HeaderMap,
+) -> XrpcResult<Json<SessionResp>> {
+    let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let secret = cfg.jwt_secret.ok_or_else(|| XrpcError::unauthorized("compat sessions not configured"))?;
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| XrpcError::unauthorized("refresh token required"))?;
+    let (typ, payload) =
+        crate::keys::verify_jwt_hs256(token, &secret).map_err(|_| XrpcError::unauthorized("bad refresh token"))?;
+    if typ != "refresh+jwt" {
+        return Err(XrpcError::unauthorized("access token cannot refresh"));
+    }
+    let did = payload.get("sub").and_then(|v| v.as_str()).ok_or_else(|| XrpcError::unauthorized("bad token"))?;
+    let exp = payload.get("exp").and_then(|v| v.as_i64()).unwrap_or(0);
+    if (worker::Date::now().as_millis() / 1000) as i64 > exp + 30 {
+        return Err(XrpcError::unauthorized("refresh token expired"));
+    }
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
-        .prepare("SELECT did, handle, email, email_confirmed, active FROM account WHERE did = ?1")
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, active FROM account WHERE did = ?1")
+        .bind(&[did.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    let Some(a) = row else {
+        return Err(XrpcError::unauthorized("unknown account"));
+    };
+    let (access_jwt, refresh_jwt) = issue_compat_pair(&s.env, &a.did)?;
+    Ok(Json(SessionResp {
+        did: a.did.clone(),
+        handle: a.handle,
+        email: a.email,
+        email_confirmed: a.email_confirmed == 1,
+        access_jwt,
+        refresh_jwt,
+        active: a.active == 1,
+    }))
+}
+
+#[worker::send]
+#[worker::send]
+async fn refresh_session_post(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<SessionResp>> {
+    refresh_session_compat(State(s), headers).await
+}
+
+#[derive(Serialize)]
+struct GetSessionResp {
+    #[serde(rename = "did")]
+    did: String,
+    #[serde(rename = "handle")]
+    handle: String,
+    #[serde(rename = "email", skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    #[serde(rename = "emailConfirmed")]
+    email_confirmed: bool,
+    #[serde(rename = "active")]
+    active: bool,
+}
+
+#[worker::send]
+async fn get_session(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<GetSessionResp>> {
+    let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.server.getSession").await?;
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let row: Option<AccountRow> = db
+        .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, active FROM account WHERE did = ?1")
         .bind(&[caller.did.clone().into()])
         .map_err(|e| XrpcError::internal(e.to_string()))?
         .first(None)
@@ -246,20 +334,19 @@ async fn refresh_session_compat(State(s): State<ServerState>, headers: HeaderMap
     let Some(a) = row else {
         return Err(XrpcError::unauthorized("unknown account"));
     };
-    Ok(Json(SessionResp {
-        did: a.did.clone(),
+    // OAuth sessions may not expose email unless transition:email was granted.
+    let email = if caller.oauth && !caller.scope.split(' ').any(|x| x == "transition:email") {
+        None
+    } else {
+        a.email
+    };
+    Ok(Json(GetSessionResp {
+        did: a.did,
         handle: a.handle,
-        email: a.email,
+        email,
         email_confirmed: a.email_confirmed == 1,
-        access_jwt: dev_jwt(&a.did, "at+jwt"),
-        refresh_jwt: dev_jwt(&a.did, "refresh+jwt"),
         active: a.active == 1,
     }))
-}
-
-#[worker::send]
-async fn get_session(State(s): State<ServerState>, headers: HeaderMap) -> XrpcResult<Json<SessionResp>> {
-    refresh_session_compat(State(s), headers).await
 }
 
 #[derive(Deserialize)]
@@ -268,6 +355,7 @@ struct AccountRow {
     handle: String,
     email: Option<String>,
     email_confirmed: i64,
+    password_hash: Option<String>,
     active: i64,
 }
 
