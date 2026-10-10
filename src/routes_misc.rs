@@ -167,6 +167,7 @@ pub fn blob_router(env: Env) -> Router {
 async fn upload_blob(State(s): State<BlobState>, headers: HeaderMap, body: axum::body::Bytes) -> XrpcResult<Json<serde_json::Value>> {
     let caller = auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.uploadBlob").await?;
     crate::repo::require_active(&s.env, &caller.did).await?;
+    crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     if body.len() > cfg.blob_upload_limit {
         return Err(XrpcError::too_large("blob exceeds PDS_BLOB_UPLOAD_LIMIT"));
@@ -455,6 +456,7 @@ struct ParResp {
 
 #[worker::send]
 async fn par(State(s): State<OAuthState>, headers: HeaderMap, axum::Form(req): axum::Form<ParReq>) -> XrpcResult<Json<ParResp>> {
+    crate::ratelimit::check(&s.env, &format!("oauth:{}", crate::ratelimit::client_ip(&headers)), 120, 60).await?;
     let cc = req.code_challenge.ok_or_else(|| XrpcError::bad_request("InvalidRequest", "PKCE code_challenge required"))?;
     if cc.len() < 43 || cc.len() > 128 {
         return Err(XrpcError::bad_request("InvalidRequest", "bad code_challenge"));
@@ -720,6 +722,10 @@ async fn token(
     headers: HeaderMap,
     axum::Form(req): axum::Form<TokenReq>,
 ) -> axum::response::Response {
+    if let Err(e) = crate::ratelimit::check(&s.env, &format!("oauth:{}", crate::ratelimit::client_ip(&headers)), 120, 60).await {
+        use axum::response::IntoResponse;
+        return e.into_response();
+    }
     match token_inner(&s.env, &headers, req).await {
         Ok(res) => res,
         Err(TokenFail::OAuth(status, code, desc)) => oauth_error(status, &code, &desc, None),

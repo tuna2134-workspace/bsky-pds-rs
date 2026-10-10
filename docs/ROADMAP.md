@@ -60,7 +60,11 @@
 - [ ] PLC 監査ログ連携・rotation 鍵の secret store 移管・`PDS_PLC_ROTATION_KEY_*` 運用
 - [x] activate/deactivate (自アカウント停止・再開 + `#account` 伝播・書き込み遮断)
 - [x] アカウント移行ハンドシェイク (reserveSigningKey→PLC 更新→createAccount 引継ぎ・移行離脱時の自動 deactive)
-- [ ] 完全な CAR 移行インポート (export→import の自動化・`#sync` 再送)
+- [x] 完全な CAR 移行インポート (`importRepo`: 署名・連鎖・再構築検証・`#sync` 再送・空標的の rev 採用)。2 PDS 間 E2E 済み
+- [x] `listMissingBlobs` (ブロブ別送フロー)
+- [x] PLC 監査連鎖の完全検証器 (`verify_audit_log`: genesis 再計算・回転鍵署名・CID 連鎖・偽造/入替拒否)
+- [ ] 監査ログの定期的再検証・secret store 移管・残 admin API・メトリクス拡充
+- [x] レート制限 (D1 固定ウィンドウ・429+Retry-After)・SMTP タイムアウト・`/metrics`
 - [ ] 取下げ/停止/削除のホスティング状態伝播
 
 ## 5. AppView/Relay 連携・運用

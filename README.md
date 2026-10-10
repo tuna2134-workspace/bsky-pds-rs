@@ -69,13 +69,20 @@ npx wrangler r2 bucket create bsky-pds-blobs
 npx wrangler d1 migrations apply bsky-pds --remote
 npx wrangler secret put PDS_ADMIN_PASSWORD
 npx wrangler secret put PDS_JWT_SECRET
-npx wrangler secret put PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX
+npx wrangler secret put PDS_EMAIL_SMTP_URL  # contains the SMTP password
 npx wrangler deploy
 ```
 
 `PDS_HOSTNAME` を自ドメインにし、DNS の `A` + `*.domain` ワイルドカードと
 `/.well-known/atproto-did` 解決を確認 (本家手順は
 [bluesky-social/pds](https://github.com/bluesky-social/pds) README 参照)。
+
+## レート制限・運用
+
+- D1 固定ウィンドウ制限: 作成 20/5分・セッション 60/分・OAuth 120/分・書込
+  600/分・プロキシ 300/分 (429 + `Retry-After`)
+- `GET /metrics`: アカウント/レコード/ブロブ/発火 seq の集計
+- SMTP 全体に 30 秒タイムアウト。メール未設定時はログモード (開発用)
 
 ## 認証方針
 

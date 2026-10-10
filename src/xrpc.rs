@@ -4,16 +4,17 @@
 use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
 use serde_json::json;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct XrpcError {
     pub status: StatusCode,
     pub error: &'static str,
     pub message: String,
+    pub headers: Vec<(axum::http::HeaderName, String)>,
 }
 
 impl XrpcError {
     pub fn new(status: StatusCode, error: &'static str, message: impl Into<String>) -> Self {
-        Self { status, error, message: message.into() }
+        Self { status, error, message: message.into(), headers: Vec::new() }
     }
     pub fn bad_request(error: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, error, message)
@@ -39,12 +40,25 @@ impl XrpcError {
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "InternalError", message)
     }
+    /// Attach an extra response header (e.g. `Retry-After` on 429).
+    pub fn header(mut self, name: &'static str, value: String) -> Self {
+        if let Ok(n) = name.parse::<axum::http::HeaderName>() {
+            self.headers.push((n, value));
+        }
+        self
+    }
 }
 
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
         let body = Json(json!({ "error": self.error, "message": self.message }));
-        (self.status, body).into_response()
+        let mut res = (self.status, body).into_response();
+        for (name, value) in self.headers {
+            if let Ok(v) = value.parse::<axum::http::HeaderValue>() {
+                res.headers_mut().insert(name, v);
+            }
+        }
+        res
     }
 }
 

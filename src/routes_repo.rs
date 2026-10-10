@@ -3,7 +3,7 @@
 //! rebuilt MST, signed commits, firehose CAR slices.
 
 use axum::{extract::{Query, State}, http::HeaderMap, Json};
-use axum::routing::{get, post};
+use axum::{extract::DefaultBodyLimit, routing::{get, post}};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 use worker::Env;
@@ -25,6 +25,11 @@ pub fn router(env: Env) -> Router {
         .route("/xrpc/com.atproto.repo.listRecords", get(list_records))
         // NOTE: uploadBlob lives in blob_router (R2-backed). Do not re-register here.
         .route("/xrpc/com.atproto.repo.applyWrites", post(apply_writes))
+        .route(
+            "/xrpc/com.atproto.repo.importRepo",
+            post(import_repo).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/xrpc/com.atproto.repo.listMissingBlobs", get(list_missing_blobs))
         .with_state(RepoState { env })
 }
 
@@ -152,6 +157,7 @@ async fn create_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
     repo::require_active(&s.env, &caller.did).await?;
+    crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     if !atproto::nsid::validate(&req.collection) {
         return Err(XrpcError::bad_request("InvalidNsid", "collection must be a valid NSID"));
     }
@@ -271,6 +277,7 @@ async fn put_record(State(s): State<RepoState>, headers: HeaderMap, Json(req): J
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
     repo::require_active(&s.env, &caller.did).await?;
+    crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     if !atproto::nsid::validate(&req.collection) || !atproto::record_key::validate(&req.rkey) {
         return Err(XrpcError::bad_request("InvalidRequest", "bad collection or rkey"));
     }
@@ -336,6 +343,7 @@ async fn delete_record(State(s): State<RepoState>, headers: HeaderMap, Json(req)
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
     repo::require_active(&s.env, &caller.did).await?;
+    crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     if let Some(expected) = req.swap_record.as_deref() {
         let cur: Option<ExistsRow> = db.prepare("SELECT cid AS cid FROM record WHERE did = ?1 AND collection = ?2 AND rkey = ?3")
@@ -445,6 +453,7 @@ async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req):
         return Err(XrpcError::forbidden("AuthFailed", "can only write to your own repo"));
     }
     repo::require_active(&s.env, &caller.did).await?;
+    crate::ratelimit::check(&s.env, &format!("write:{}", caller.did), 600, 60).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let now = pds_env::now_iso();
     let mut ops = Vec::new();
@@ -537,4 +546,330 @@ async fn apply_writes(State(s): State<RepoState>, headers: HeaderMap, Json(req):
             "results": results,
         }),
     ))
+}
+
+// --- importRepo (migration target) ---
+
+/// Import a full-repo CAR (migration reset semantics). The commit must belong
+/// to the caller, verify against the DID key, and be internally consistent
+/// (hash chain + rebuilt root). State is replaced wholesale and a `#sync`
+/// event fires. Blobs travel separately — see `listMissingBlobs`.
+#[worker::send]
+async fn import_repo(
+    State(s): State<RepoState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> XrpcResult<Json<serde_json::Value>> {
+    if body.len() > 64_000_000 {
+        return Err(XrpcError::too_large("CAR exceeds 64MB import limit"));
+    }
+    if body.is_empty() {
+        return Err(XrpcError::bad_request("InvalidRequest", "empty CAR"));
+    }
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if ct != "application/vnd.ipld.car" && ct != "application/octet-stream" {
+        return Err(XrpcError::bad_request("InvalidRequest", "content-type must be application/vnd.ipld.car"));
+    }
+    let (roots, blocks) = crate::mst::parse_car(&body).map_err(|e| XrpcError::bad_request("InvalidCar", e.to_string()))?;
+    let root = roots.into_iter().next().ok_or_else(|| XrpcError::bad_request("InvalidCar", "no roots"))?;
+    let (commit_cid, commit_bytes) = blocks.first().cloned().ok_or_else(|| XrpcError::bad_request("InvalidCar", "no commit"))?;
+    if commit_cid != root {
+        return Err(XrpcError::bad_request("InvalidCar", "first block must be the commit"));
+    }
+    let commit = crate::mst::parse_commit(&commit_bytes).map_err(|e| XrpcError::bad_request("InvalidCar", e.to_string()))?;
+    // Caller must own the repo (or be the admin assisting a migration).
+    let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let is_admin = auth::check_admin(&headers, cfg.admin_password.as_deref()).is_ok();
+    let caller_did = if is_admin {
+        None
+    } else {
+        // Method+path for DPoP binding: this procedure itself.
+        Some(auth::authenticate(&s.env, &headers, "POST", "/xrpc/com.atproto.repo.importRepo").await?.did)
+    };
+    if let Some(caller) = caller_did.as_deref() {
+        if caller != commit.did {
+            return Err(XrpcError::forbidden("AuthFailed", "can only import your own repo"));
+        }
+    }
+    let did = commit.did.clone();
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    // Target account must exist (create it — possibly via reserved key — first).
+    #[derive(serde::Deserialize)]
+    struct ExistsAcct {
+        #[allow(dead_code)]
+        did: String,
+    }
+    let acct: Option<ExistsAcct> = db
+        .prepare("SELECT did FROM account WHERE did = ?1")
+        .bind(&[did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .first(None)
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    if acct.is_none() {
+        return Err(XrpcError::not_found("RepoNotFound", "no local account for this DID; create it first"));
+    }
+    // Signature: resolved DID key preferred, stored account key as fallback.
+    let verified = verify_commit_against_did(&s.env, &did, &commit_bytes).await;
+    if verified.is_err() {
+        // Fallback: stored repo key (dev DIDs, pre-PLC accounts).
+        let key_row: Option<StoredKeyRow> = db
+            .prepare("SELECT signing_key_k256_pub_hex AS pub_hex FROM account WHERE did = ?1")
+            .bind(&[did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first(None)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        match key_row.and_then(|k| k.pub_hex) {
+            Some(pub_hex) => {
+                crate::mst::verify_commit(&pub_hex, &commit_bytes)
+                    .map_err(|_| XrpcError::bad_request("InvalidCar", "commit signature invalid"))?;
+            }
+            None => return Err(XrpcError::bad_request("InvalidCar", "commit signature invalid")),
+        }
+    }
+    // Full integrity: walk reachable nodes, collect records, rebuild root.
+    let mut nodes: std::collections::HashMap<String, crate::mst::ParsedNode> = std::collections::HashMap::new();
+    let mut records: Vec<(String, String, String, serde_json::Value)> = Vec::new(); // collection, rkey, cid, json
+    {
+        let mut by_cid: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+        for (cid, bytes) in blocks.iter().skip(1) {
+            by_cid.insert(cid.to_string(), bytes.clone());
+        }
+        let mut stack = vec![commit.data.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(cid) = stack.pop() {
+            if !seen.insert(cid.to_string()) {
+                continue;
+            }
+            let bytes = by_cid.get(&cid.to_string()).ok_or_else(|| XrpcError::bad_request("InvalidCar", "dangling MST link"))?;
+            let node = crate::mst::parse_node(bytes).map_err(|e| XrpcError::bad_request("InvalidCar", e.to_string()))?;
+            if let Some(left) = &node.left {
+                stack.push(left.clone());
+            }
+            for e in &node.entries {
+                let path = String::from_utf8(e.key.clone()).map_err(|_| XrpcError::bad_request("InvalidCar", "non-UTF8 path"))?;
+                let (collection, rkey) = path.split_once('/').ok_or_else(|| XrpcError::bad_request("InvalidCar", "bad path"))?;
+                if !crate::atproto::nsid::validate(collection) || !crate::atproto::record_key::validate(rkey) {
+                    return Err(XrpcError::bad_request("InvalidCar", format!("bad record path: {path}")));
+                }
+                let rec_bytes = by_cid.get(&e.value.to_string()).ok_or_else(|| XrpcError::bad_request("InvalidCar", "dangling record link"))?;
+                if crate::cid::Cid::dag_cbor(rec_bytes) != e.value {
+                    return Err(XrpcError::bad_request("InvalidCar", "record bytes mismatch"));
+                }
+                let dag = crate::cbor::decode_exact(rec_bytes).map_err(|e| XrpcError::bad_request("InvalidCar", e.to_string()))?;
+                let value = crate::cbor::to_json(&dag);
+                if value.get("$type").and_then(|v| v.as_str()).is_none_or(|t| t.is_empty()) {
+                    return Err(XrpcError::bad_request("InvalidCar", "record missing $type"));
+                }
+                records.push((collection.to_string(), rkey.to_string(), e.value.to_string(), value));
+                if let Some(right) = &e.right {
+                    stack.push(right.clone());
+                }
+            }
+            nodes.insert(cid.to_string(), node);
+        }
+        // Rebuild must reproduce the commit root exactly.
+        let mut entries: Vec<crate::mst::MstEntry> = Vec::with_capacity(records.len());
+        for (c, k, cid, _) in &records {
+            let parsed = crate::cid::Cid::parse(cid).map_err(|e| XrpcError::bad_request("InvalidCar", e.to_string()))?;
+            entries.push(crate::mst::MstEntry { key: format!("{c}/{k}").into_bytes(), cid: parsed });
+        }
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let rebuilt = crate::mst::build(&entries).map_err(|e| XrpcError::internal(e.to_string()))?;
+        if rebuilt.root != commit.data {
+            return Err(XrpcError::bad_request("InvalidCar", "tree root mismatch"));
+        }
+        // Rev must advance (reset semantics forbid rewinding history), except
+        // into a fresh migration target holding no records yet (adopts rev).
+        #[derive(serde::Deserialize)]
+        struct RevRow {
+            rev: String,
+        }
+        let cur: Option<RevRow> = db
+            .prepare("SELECT rev FROM repo_root WHERE did = ?1")
+            .bind(&[did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first(None)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+        #[derive(serde::Deserialize)]
+        struct CountRow {
+            n: f64,
+        }
+        let existing: i64 = db
+            .prepare("SELECT COUNT(*) AS n FROM record WHERE did = ?1")
+            .bind(&[did.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .first::<CountRow>(None)
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .map(|r| r.n as i64)
+            .unwrap_or(0);
+        if let Some(cur) = cur {
+            if existing > 0 && commit.rev.as_str() <= cur.rev.as_str() {
+                return Err(XrpcError::bad_request("InvalidCar", "imported rev must advance"));
+            }
+        }
+    }
+    // Replace state wholesale.
+    let now = pds_env::now_iso();
+    db.prepare("DELETE FROM record WHERE did = ?1")
+        .bind(&[did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    for (collection, rkey, cid, value) in &records {
+        let canonical = serde_json::to_string(value).map_err(|e| XrpcError::internal(e.to_string()))?;
+        db.prepare("INSERT INTO record (did, collection, rkey, cid, value_json, rev, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)")
+            .bind(&[did.clone().into(), collection.clone().into(), rkey.clone().into(), cid.clone().into(), canonical.into(), commit.rev.clone().into(), now.clone().into()])
+            .map_err(|e| XrpcError::internal(e.to_string()))?
+            .run()
+            .await
+            .map_err(|e| XrpcError::internal(e.to_string()))?;
+    }
+    db.prepare("INSERT INTO repo_root (did, rev, data_cid, commit_cid, updated_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(did) DO UPDATE SET rev = excluded.rev, data_cid = excluded.data_cid, commit_cid = excluded.commit_cid, updated_at = excluded.updated_at")
+        .bind(&[did.clone().into(), commit.rev.clone().into(), commit.data.to_string().into(), commit_cid.to_string().into(), now.into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .run()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    crate::firehose::emit_sync(&s.env, &did, &commit.rev, &commit_cid, &commit_bytes).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+#[derive(serde::Deserialize)]
+struct StoredKeyRow {
+    pub_hex: Option<String>,
+}
+
+async fn verify_commit_against_did(env: &Env, did: &str, commit_bytes: &[u8]) -> XrpcResult<()> {
+    let doc = crate::identity::resolve_did(env, did).await?;
+    let (_, pub_hex) = doc
+        .signing_key
+        .ok_or_else(|| XrpcError::bad_request("InvalidCar", "DID has no signing key"))?;
+    crate::mst::verify_commit(&pub_hex, commit_bytes)
+        .map_err(|_| XrpcError::bad_request("InvalidCar", "commit signature invalid"))?;
+    Ok(())
+}
+
+// --- listMissingBlobs (migration helper) ---
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct MissingBlobsParam {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+/// Blobs referenced by records but absent from the store, with the
+/// referencing record URI. Cursor is a `cid` offset over the sorted set.
+#[worker::send]
+async fn list_missing_blobs(
+    State(s): State<RepoState>,
+    headers: HeaderMap,
+    Query(q): Query<MissingBlobsParam>,
+) -> XrpcResult<Json<serde_json::Value>> {
+    let caller = auth::authenticate(&s.env, &headers, "GET", "/xrpc/com.atproto.repo.listMissingBlobs").await?;
+    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
+    let rows = db
+        .prepare("SELECT collection, rkey, value_json AS v FROM record WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .all()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct RecVal {
+        #[serde(rename = "v")]
+        v: String,
+        collection: String,
+        rkey: String,
+    }
+    // cid -> first recordUri (sorted for stable pagination).
+    let mut missing: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    // Present blob cids for this account.
+    let present_rows = db
+        .prepare("SELECT cid AS c FROM blob WHERE did = ?1")
+        .bind(&[caller.did.clone().into()])
+        .map_err(|e| XrpcError::internal(e.to_string()))?
+        .all()
+        .await
+        .map_err(|e| XrpcError::internal(e.to_string()))?;
+    #[derive(serde::Deserialize)]
+    struct CidRow {
+        c: String,
+    }
+    let present: std::collections::HashSet<String> = present_rows
+        .results::<CidRow>()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.c)
+        .collect();
+    for r in rows.results::<RecVal>().unwrap_or_default() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&r.v) else {
+            continue;
+        };
+        for cid in find_blob_refs(&value) {
+            if !present.contains(&cid) {
+                missing
+                    .entry(cid)
+                    .or_insert_with(|| format!("at://{}/{}/{}", caller.did, r.collection, r.rkey));
+            }
+        }
+    }
+    let mut blobs = Vec::new();
+    let mut last: Option<String> = None;
+    let after = q.cursor.clone().unwrap_or_default();
+    for (cid, uri) in &missing {
+        if cid.as_str() <= after.as_str() && !after.is_empty() {
+            continue;
+        }
+        blobs.push(serde_json::json!({ "cid": cid, "recordUri": uri }));
+        last = Some(cid.clone());
+        if blobs.len() as i64 >= limit {
+            break;
+        }
+    }
+    let mut out = serde_json::json!({ "blobs": blobs });
+    if blobs.len() as i64 >= limit {
+        if let Some(c) = last {
+            out["cursor"] = serde_json::Value::String(c);
+        }
+    }
+    Ok(Json(out))
+}
+
+/// Recursively collect `{"$type":"blob","ref":{"$link":cid}}` references.
+fn find_blob_refs(value: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_blob_refs(value, &mut out);
+    out
+}
+
+fn collect_blob_refs(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(m) => {
+            if m.get("$type").and_then(|v| v.as_str()) == Some("blob") {
+                if let Some(cid) = m.get("ref").and_then(|r| r.get("$link")).and_then(|l| l.as_str()) {
+                    out.push(cid.to_string());
+                    return;
+                }
+            }
+            for v in m.values() {
+                collect_blob_refs(v, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for v in a {
+                collect_blob_refs(v, out);
+            }
+        }
+        _ => {}
+    }
 }

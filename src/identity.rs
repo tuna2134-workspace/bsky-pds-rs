@@ -717,3 +717,175 @@ pub fn verify_plc_op(op: &serde_json::Value, rotation_keys: &[String]) -> Result
     }
     Err("no rotation key verifies this op".into())
 }
+
+// ---------- PLC audit verification ----------
+
+/// Fully validate a DID's operation log: genesis DID recomputation, per-op
+/// rotation-key signatures, and CID hash chaining. `entries` are audit items
+/// with `operation` + `cid` (sequenced export shape).
+pub fn verify_audit_log(did: &str, entries: &[serde_json::Value]) -> Result<usize, String> {
+    if entries.is_empty() {
+        return Err("empty audit log".into());
+    }
+    // Genesis: DID must recompute.
+    let genesis = entries[0].get("operation").ok_or("entry lacks operation".to_string())?;
+    let genesis_bytes = cbor::encode_json(genesis).map_err(|e| e.to_string())?;
+    let hash = keys::sha256_of(&genesis_bytes);
+    let b32 = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &hash).to_lowercase();
+    if did != format!("did:plc:{}", &b32[..24]) {
+        return Err("genesis does not match DID".into());
+    }
+    let mut rotation_keys: Vec<String> = genesis
+        .get("rotationKeys")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|k| k.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    if rotation_keys.is_empty() {
+        return Err("genesis lacks rotationKeys".into());
+    }
+    verify_plc_op(genesis, &rotation_keys)?;
+    let mut prev_bytes = genesis_bytes;
+    for entry in &entries[1..] {
+        let op = entry.get("operation").ok_or("entry lacks operation".to_string())?;
+        // CID linkage.
+        let op_bytes = cbor::encode_json(op).map_err(|e| e.to_string())?;
+        let expect_prev = {
+            let h = keys::sha256_of(&prev_bytes);
+            let mut raw = vec![0x01, 0x71, 0x12, 0x20];
+            raw.extend_from_slice(&h);
+            format!("b{}", base32::encode(base32::Alphabet::RFC4648 { padding: false }, &raw).to_lowercase())
+        };
+        match op.get("prev") {
+            Some(serde_json::Value::String(prev)) if prev == &expect_prev => {}
+            _ => return Err("prev CID break".into()),
+        }
+        verify_plc_op(op, &rotation_keys)?;
+        // Advance rotation keys from this op.
+        if let Some(keys) = op.get("rotationKeys").and_then(|v| v.as_array()) {
+            rotation_keys = keys.iter().filter_map(|k| k.as_str().map(|s| s.to_string())).collect();
+        }
+        prev_bytes = op_bytes;
+    }
+    Ok(entries.len())
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    const ROT_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const ROT_B: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364140";
+
+    fn did_key(priv_hex: &str) -> String {
+        let pub_hex = keys::k256_pub_from_priv(priv_hex).unwrap();
+        did_key_encode(&pub_hex, &Curve::K256).unwrap()
+    }
+
+    fn sign_op(priv_hex: &str, mut op: serde_json::Value) -> serde_json::Value {
+        let bytes = unsigned_op_cbor(&op).unwrap();
+        let sig = low_s_k256(priv_hex, &keys::sha256_of(&bytes)).unwrap();
+        use base64::Engine as _;
+        op["sig"] = serde_json::Value::String(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig));
+        op
+    }
+
+    fn genesis_op_for(key_priv: &str) -> (String, serde_json::Value) {
+        plc_genesis_op(
+            key_priv,
+            &PlcGenesis {
+                rotation_did_key: did_key(key_priv),
+                signing_did_key: did_key(key_priv),
+                handle: "audit.test".into(),
+                pds_endpoint: "https://example.test".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn op_cid(op: &serde_json::Value) -> String {
+        let bytes = cbor::encode_json(op).unwrap();
+        let h = keys::sha256_of(&bytes);
+        let mut raw = vec![0x01, 0x71, 0x12, 0x20];
+        raw.extend_from_slice(&h);
+        format!("b{}", base32::encode(base32::Alphabet::RFC4648 { padding: false }, &raw).to_lowercase())
+    }
+
+    #[test]
+    fn audit_chain_validates() {
+        let (did, genesis) = genesis_op_for(ROT_A);
+        // Update: rotate to key B, signed by A.
+        let update = sign_op(
+            ROT_A,
+            serde_json::json!({
+                "type": "plc_operation",
+                "rotationKeys": [did_key(ROT_B)],
+                "verificationMethods": {"atproto": did_key(ROT_A)},
+                "alsoKnownAs": ["at://audit.test"],
+                "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer", "endpoint": "https://example.test"}},
+                "prev": op_cid(&genesis),
+            }),
+        );
+        // Recovery-style follow-up signed by B.
+        let update2 = sign_op(
+            ROT_B,
+            serde_json::json!({
+                "type": "plc_operation",
+                "rotationKeys": [did_key(ROT_B)],
+                "verificationMethods": {"atproto": did_key(ROT_B)},
+                "alsoKnownAs": ["at://audit2.test"],
+                "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer", "endpoint": "https://example.test"}},
+                "prev": op_cid(&update),
+            }),
+        );
+        let entries = vec![
+            serde_json::json!({"did": did, "cid": op_cid(&genesis), "operation": genesis}),
+            serde_json::json!({"did": did, "cid": op_cid(&update), "operation": update}),
+            serde_json::json!({"did": did, "cid": op_cid(&update2), "operation": update2}),
+        ];
+        assert_eq!(verify_audit_log(&did, &entries).unwrap(), 3);
+    }
+
+    #[test]
+    fn audit_rejects_forgery_and_reorder() {
+        let (did, genesis) = genesis_op_for(ROT_A);
+        let update = sign_op(
+            ROT_A,
+            serde_json::json!({
+                "type": "plc_operation",
+                "rotationKeys": [did_key(ROT_B)],
+                "verificationMethods": {"atproto": did_key(ROT_A)},
+                "alsoKnownAs": ["at://audit.test"],
+                "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer", "endpoint": "https://example.test"}},
+                "prev": op_cid(&genesis),
+            }),
+        );
+        let entries = vec![
+            serde_json::json!({"did": did, "cid": op_cid(&genesis), "operation": genesis.clone()}),
+            serde_json::json!({"did": did, "cid": op_cid(&update), "operation": update}),
+        ];
+        verify_audit_log(&did, &entries).unwrap();
+        // Reordered.
+        let mut swapped = entries.clone();
+        swapped.swap(0, 1);
+        assert!(verify_audit_log(&did, &swapped).is_err());
+        // Attacker-signed update (unknown key) fails even with a fixed prev.
+        let evil = sign_op(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            serde_json::json!({
+                "type": "plc_operation",
+                "rotationKeys": [did_key(ROT_A)],
+                "verificationMethods": {"atproto": did_key(ROT_A)},
+                "alsoKnownAs": ["at://evil.test"],
+                "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer", "endpoint": "https://evil.test"}},
+                "prev": op_cid(&genesis),
+            }),
+        );
+        let evil_entries = vec![
+            serde_json::json!({"did": did, "cid": op_cid(&genesis), "operation": genesis}),
+            serde_json::json!({"did": did, "cid": op_cid(&evil), "operation": evil}),
+        ];
+        assert!(verify_audit_log(&did, &evil_entries).is_err());
+        // Wrong DID.
+        assert!(verify_audit_log("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &entries[0..1].to_vec()).is_err());
+    }
+}

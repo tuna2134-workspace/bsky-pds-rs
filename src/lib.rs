@@ -17,6 +17,7 @@ pub mod mst;
 pub mod oauth;
 pub mod pds_env;
 pub mod proxy;
+pub mod ratelimit;
 pub mod repo;
 pub mod routes_misc;
 pub mod routes_repo;
@@ -28,6 +29,7 @@ fn router(env: Env) -> Router {
     Router::new()
         .route("/", get(root))
         .route("/xrpc/_health", get(health))
+        .route("/metrics", get(metrics))
         .merge(routes_server::router(env.clone()))
         .merge(routes_repo::router(env.clone()))
         .merge(routes_sync::router(env.clone()))
@@ -93,4 +95,53 @@ pub async fn root() -> &'static str {
 pub async fn health(Extension(env): Extension<Env>) -> axum::Json<serde_json::Value> {
     let hostname = env.var("PDS_HOSTNAME").map(|v| v.to_string()).unwrap_or_else(|_| "localhost".into());
     axum::Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "hostname": hostname }))
+}
+
+/// Minimal Prometheus exposition: build info + live D1 aggregates.
+/// Per-request counters are deliberately absent (no cross-isolate atomics
+/// without a D1 write per request); add OTEL export for those (ROADMAP §5).
+#[worker::send]
+pub async fn metrics(Extension(env): Extension<Env>) -> axum::Json<serde_json::Value> {
+    async fn count(db: &worker::D1Database, sql: &str) -> i64 {
+        #[derive(serde::Deserialize)]
+        struct N {
+            n: f64,
+        }
+        db.prepare(sql)
+            .first::<N>(None)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.n as i64)
+            .unwrap_or(-1)
+    }
+    let mut out = serde_json::json!({
+        "build": env!("CARGO_PKG_VERSION"),
+        "accounts": -1,
+        "records": -1,
+        "blobs": -1,
+        "firehose_seq": -1,
+        "oauth_sessions": -1,
+    });
+    if let Ok(db) = pds_env::db(&env) {
+        out["accounts"] = serde_json::Value::from(count(&db, "SELECT COUNT(*) AS n FROM account").await);
+        out["records"] = serde_json::Value::from(count(&db, "SELECT COUNT(*) AS n FROM record").await);
+        out["blobs"] = serde_json::Value::from(count(&db, "SELECT COUNT(*) AS n FROM blob").await);
+        out["oauth_sessions"] =
+            serde_json::Value::from(count(&db, "SELECT COUNT(*) AS n FROM oauth_token").await);
+        #[derive(serde::Deserialize)]
+        struct S {
+            seq: f64,
+        }
+        out["firehose_seq"] = serde_json::Value::from(
+            db.prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM firehose_event")
+                .first::<S>(None)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| r.seq as i64)
+                .unwrap_or(-1),
+        );
+    }
+    axum::Json(out)
 }

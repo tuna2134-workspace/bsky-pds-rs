@@ -30,7 +30,8 @@
 | createRecord / getRecord / putRecord / deleteRecord / listRecords | ✅ | 実 DAG-CBOR CID・署名 commit・`rev` 採番・firehose CAR slice。`swapCommit`/`swapRecord` 対応 |
 | applyWrites | ✅ (create のみ完全) | update/delete は結果形のみ、次段で完全化 |
 | uploadBlob | ✅ | R2 実体 + D1 インデックス。参照 CID は raw sha2-256 (`bafkrei…`) |
-| listMissingBlobs | ⬜ | checkAccountStatus で代替計数。CAR 自動 import は未着手 |
+| listMissingBlobs | ✅ | 参照-保持差分 (recordUri 付き・cid カーソル) |
+| importRepo | ✅ | 署名・連鎖・再構築検証・`#sync`・空標的 rev 採用 |
 
 ## sync (`com.atproto.sync.*`)
 
@@ -61,6 +62,7 @@
 |---|---|---|
 | getAccountInfo | ✅ | 管理者トークン必須 |
 | updateAccountPassword 等の残 admin API | ⬜ | 監査ログ・takedown 伝播と同時実装 |
+| レート制限 (429+Retry-After) / /metrics | ✅ | D1 固定ウィンドウ・集計エンドポイント |
 
 ## OAuth (`/.well-known/*`, `/oauth/*`, `/jwks.json`)
 

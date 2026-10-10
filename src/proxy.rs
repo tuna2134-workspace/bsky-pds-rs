@@ -36,6 +36,7 @@ pub async fn proxy_fallback(
     // Must be an authenticated local user (rate limits still apply at edge).
     let http_method = method.as_str().to_string();
     let caller = auth::authenticate(&env, &headers, http_method.as_str(), path.as_str()).await?;
+    crate::ratelimit::check(&env, &format!("proxy:{}", caller.did), 300, 60).await?;
 
     // Resolve the service endpoint; SSRF-guarded.
     let endpoint = identity::resolve_service(&env, &service_did, &service_id).await?;

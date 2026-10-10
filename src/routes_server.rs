@@ -115,6 +115,7 @@ async fn create_account(
     headers: HeaderMap,
     Json(req): Json<CreateAccountReq>,
 ) -> XrpcResult<Json<CreateAccountResp>> {
+    crate::ratelimit::check(&s.env, &format!("acct:{}", crate::ratelimit::client_ip(&headers)), 20, 300).await?;
     let cfg = pds_env::PdsEnv::from_env(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     if !atproto::handle::validate(&req.handle) {
         return Err(XrpcError::bad_request("InvalidHandle", "handle syntax invalid"));
@@ -329,8 +330,10 @@ struct SessionResp {
 #[worker::send]
 async fn create_session_compat(
     State(s): State<ServerState>,
+    headers: HeaderMap,
     Json(req): Json<CreateSessionReq>,
 ) -> XrpcResult<Json<SessionResp>> {
+    crate::ratelimit::check(&s.env, &format!("session:{}", crate::ratelimit::client_ip(&headers)), 60, 60).await?;
     let db = pds_env::db(&s.env).map_err(|e| XrpcError::internal(e.to_string()))?;
     let row: Option<AccountRow> = db
         .prepare("SELECT did, handle, email, email_confirmed, password_hash AS password_hash, session_epoch, active FROM account WHERE handle = ?1 OR email = ?1 OR did = ?1")

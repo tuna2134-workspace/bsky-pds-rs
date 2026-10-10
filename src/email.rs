@@ -252,7 +252,19 @@ impl LineTransport for SocketTransport {
 }
 
 /// Submit one message, upgrading to TLS when the server offers STARTTLS.
+/// The whole attempt is bounded (30s) so a dead SMTP host cannot hang a request.
 pub async fn smtp_send(cfg: &SmtpConfig, from: &str, to: &str, data: &str) -> Result<(), String> {
+    use futures_util::future::{select, Either};
+    let attempt = smtp_send_inner(cfg, from, to, data);
+    let timeout = worker::Delay::from(std::time::Duration::from_secs(30));
+    futures_util::pin_mut!(attempt, timeout);
+    match select(attempt, timeout).await {
+        Either::Left((r, _)) => r,
+        Either::Right(_) => Err("SMTP timeout (30s)".into()),
+    }
+}
+
+async fn smtp_send_inner(cfg: &SmtpConfig, from: &str, to: &str, data: &str) -> Result<(), String> {
     use worker::Socket;
     if cfg.implicit_tls {
         let socket = Socket::builder()
